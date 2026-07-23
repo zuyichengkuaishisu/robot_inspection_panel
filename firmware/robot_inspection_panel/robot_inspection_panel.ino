@@ -6,8 +6,10 @@
 #include <WiFi.h>
 #include <lvgl.h>
 #include <LovyanGFX.hpp>
+#include <qrcode.h>
 
 #include "CST816D.h"
+#include "ProvisioningPortal.h"
 #include "config.h"
 
 static constexpr uint16_t SCREEN_W = 240;
@@ -41,10 +43,12 @@ class LGFX : public lgfx::LGFX_Device {
 };
 
 struct Option { char id[32]; char name[48]; };
-enum Page { HOME, CONFIRM_CALL, WAIT_ARRIVAL, PICK_INSPECTION, INSPECTION_STATUS, ERROR_PAGE };
+enum Page { HOME, CONFIRM_CALL, WAIT_ARRIVAL, PICK_INSPECTION, INSPECTION_STATUS, ERROR_PAGE, NETWORK_SETUP };
+enum PendingAction { NO_ACTION, LOAD_POINTS, LOAD_INSPECTIONS, SEND_NAVIGATION, SEND_INSPECTION };
 
 LGFX tft;
 CST816D touch(4, 5, 1, 0);
+ProvisioningPortal provisioning;
 static lv_color_t draw_a[SCREEN_W * DRAW_ROWS];
 static lv_color_t draw_b[SCREEN_W * DRAW_ROWS];
 static lv_display_t *display;
@@ -62,9 +66,16 @@ static int previous_touch_count = -2;
 static uint32_t touch_input_reads = 0;
 static bool raw_touch_pressed = false;
 static unsigned long last_raw_tap_ms = 0;
-static bool direct_dirty = true;
+static unsigned long title_hold_since = 0;
+static bool title_hold_triggered = false;
+static PendingAction pending_action = NO_ACTION;
+static unsigned long pending_action_since = 0;
 
-#define LOGI(format, ...) Serial.printf("[panel][%8lu] " format "\n", millis(), ##__VA_ARGS__)
+#define LOGI(format, ...) do { \
+  if (Serial && Serial.availableForWrite() >= 128) { \
+    Serial.printf("[panel][%8lu] " format "\n", millis(), ##__VA_ARGS__); \
+  } \
+} while (0)
 
 static void showPage(Page next);
 static bool fetchPoints();
@@ -73,8 +84,9 @@ static bool createNavigation();
 static bool createInspection();
 static void handleRawTap(uint16_t x, uint16_t y);
 static void renderDirectPage();
+static void scheduleAction(PendingAction action);
 
-static String endpoint(const char *path) { return String(BACKEND_URL) + path; }
+static String endpoint(const char *path) { return provisioning.backendUrl() + path; }
 
 static const char *pageName(Page value) {
   switch (value) {
@@ -84,6 +96,7 @@ static const char *pageName(Page value) {
     case PICK_INSPECTION: return "PICK_INSPECTION";
     case INSPECTION_STATUS: return "INSPECTION_STATUS";
     case ERROR_PAGE: return "ERROR";
+    case NETWORK_SETUP: return "NETWORK_SETUP";
   }
   return "UNKNOWN";
 }
@@ -95,13 +108,13 @@ static void addAuth(HTTPClient &http) {
 static bool getJson(const String &url, JsonDocument &doc) {
   HTTPClient http; http.setConnectTimeout(4000); http.setTimeout(5000);
   LOGI("HTTP GET %s", url.c_str());
-  if (!http.begin(url)) { error_message = "Invalid backend URL"; LOGI("GET rejected: invalid URL"); return false; }
+  if (!http.begin(url)) { error_message = "后端地址无效"; LOGI("GET rejected: invalid URL"); return false; }
   addAuth(http);
   int code = http.GET();
   String body = http.getString(); http.end();
   LOGI("GET response code=%d bytes=%u", code, body.length());
-  if (code != HTTP_CODE_OK) { error_message = code > 0 ? "Backend HTTP " + String(code) : "Backend unreachable"; LOGI("GET failed: %s", error_message.c_str()); return false; }
-  if (deserializeJson(doc, body)) { error_message = "Invalid backend response"; LOGI("GET failed: JSON parse error"); return false; }
+  if (code != HTTP_CODE_OK) { error_message = code > 0 ? "后端错误 " + String(code) : "无法连接后端"; LOGI("GET failed: %s", error_message.c_str()); return false; }
+  if (deserializeJson(doc, body)) { error_message = "后端响应无效"; LOGI("GET failed: JSON parse error"); return false; }
   return true;
 }
 
@@ -109,13 +122,13 @@ static bool postJson(const char *path, JsonDocument &request, JsonDocument &resp
   HTTPClient http; http.setConnectTimeout(4000); http.setTimeout(5000);
   String url = endpoint(path);
   LOGI("HTTP POST %s", url.c_str());
-  if (!http.begin(url)) { error_message = "Invalid backend URL"; LOGI("POST rejected: invalid URL"); return false; }
+  if (!http.begin(url)) { error_message = "后端地址无效"; LOGI("POST rejected: invalid URL"); return false; }
   http.addHeader("Content-Type", "application/json"); addAuth(http);
   String body; serializeJson(request, body);
   int code = http.POST(body); String reply = http.getString(); http.end();
   LOGI("POST response code=%d request_bytes=%u response_bytes=%u", code, body.length(), reply.length());
-  if (code != HTTP_CODE_OK && code != HTTP_CODE_CREATED) { error_message = code > 0 ? "Request failed (" + String(code) + ")" : "Backend unreachable"; LOGI("POST failed: %s", error_message.c_str()); return false; }
-  if (deserializeJson(response, reply)) { error_message = "Invalid backend response"; LOGI("POST failed: JSON parse error"); return false; }
+  if (code != HTTP_CODE_OK && code != HTTP_CODE_CREATED) { error_message = code > 0 ? "请求失败 " + String(code) : "无法连接后端"; LOGI("POST failed: %s", error_message.c_str()); return false; }
+  if (deserializeJson(response, reply)) { error_message = "后端响应无效"; LOGI("POST failed: JSON parse error"); return false; }
   return true;
 }
 
@@ -130,10 +143,10 @@ static bool fetchPoints() {
   for (JsonObject item : doc["points"].as<JsonArray>()) {
     if (point_count == MAX_POINTS) break;
     strlcpy(points[point_count].id, item["id"] | "", sizeof(points[0].id));
-    strlcpy(points[point_count].name, item["name"] | "Unnamed point", sizeof(points[0].name));
+    strlcpy(points[point_count].name, item["name"] | "未命名点位", sizeof(points[0].name));
     ++point_count;
   }
-  if (!point_count) { error_message = "No inspection points"; return false; }
+  if (!point_count) { error_message = "暂无巡检点位"; return false; }
   LOGI("Loaded %u point(s)", point_count);
   return true;
 }
@@ -145,10 +158,10 @@ static bool fetchInspections() {
   for (JsonObject item : doc["inspections"].as<JsonArray>()) {
     if (inspection_count == MAX_INSPECTIONS) break;
     strlcpy(inspections[inspection_count].id, item["id"] | "", sizeof(inspections[0].id));
-    strlcpy(inspections[inspection_count].name, item["name"] | "Inspection", sizeof(inspections[0].name));
+    strlcpy(inspections[inspection_count].name, item["name"] | "巡检项目", sizeof(inspections[0].name));
     ++inspection_count;
   }
-  if (!inspection_count) { error_message = "No inspections available"; return false; }
+  if (!inspection_count) { error_message = "暂无巡检项目"; return false; }
   LOGI("Loaded %u inspection option(s) for point=%s", inspection_count, points[selected_point].id);
   return true;
 }
@@ -180,7 +193,7 @@ static bool pollTask() {
   JsonDocument doc;
   if (!getJson(endpoint("/api/tasks/") + task_id, doc)) return false;
   String previous = task_status;
-  task_status = doc["status"] | "failed"; task_message = doc["message"] | "No status";
+  task_status = doc["status"] | "failed"; task_message = doc["message"] | "暂无状态";
   if (previous != task_status) LOGI("Task %s status %s -> %s: %s", task_id.c_str(), previous.c_str(), task_status.c_str(), task_message.c_str());
   return true;
 }
@@ -205,15 +218,16 @@ static void retry(lv_event_t *) { LOGI("UI: retry from %s", pageName(page)); sho
 static void selectPoint(lv_event_t *e) { selected_point = (intptr_t)lv_event_get_user_data(e); LOGI("UI: selected point=%s", points[selected_point].id); showPage(CONFIRM_CALL); }
 static void confirmCall(lv_event_t *) {
   LOGI("UI: call confirmed");
-  task_status = "sending"; task_message = "Sending robot call";
+  task_status = "sending"; task_message = "正在发送机器人呼叫";
   showPage(WAIT_ARRIVAL);
-  if (createNavigation()) showPage(WAIT_ARRIVAL); else showPage(ERROR_PAGE);
+  scheduleAction(SEND_NAVIGATION);
 }
 static void selectInspection(lv_event_t *e) {
-  selected_inspection = (intptr_t)lv_event_get_user_data(e); LOGI("UI: selected inspection=%s", inspections[selected_inspection].id);
-  task_status = "sending"; task_message = "Starting inspection";
+  if (e) selected_inspection = (intptr_t)lv_event_get_user_data(e);
+  LOGI("UI: selected inspection=%s", inspections[selected_inspection].id);
+  task_status = "sending"; task_message = "正在启动巡检";
   showPage(INSPECTION_STATUS);
-  if (createInspection()) showPage(INSPECTION_STATUS); else showPage(ERROR_PAGE);
+  scheduleAction(SEND_INSPECTION);
 }
 
 // Fallback dispatcher for the CST816D. It keeps the panel usable if LVGL's
@@ -221,89 +235,184 @@ static void selectInspection(lv_event_t *e) {
 static void handleRawTap(uint16_t x, uint16_t y) {
   LOGI("Raw tap x=%u y=%u page=%s", x, y, pageName(page));
   if (page == HOME) {
+    if (!provisioning.isNormal() && y >= 168) {
+      provisioning.startPortal();
+      page = NETWORK_SETUP;
+      renderDirectPage();
+      provisioning.clearRenderRequest();
+      return;
+    }
     for (uint8_t i = 0; i < point_count; ++i) {
-      int top = 82 + i * 38;
+      int top = 86 + i * 36;
       if (y >= top && y < top + 34) { selected_point = i; showPage(CONFIRM_CALL); return; }
     }
   } else if (page == CONFIRM_CALL) {
-    if (y >= 140 && y < 182) { confirmCall(nullptr); return; }
-    if (y >= 182) { goHome(nullptr); return; }
+    if (y >= 140 && y < 174) { confirmCall(nullptr); return; }
+    if (y >= 174) { goHome(nullptr); return; }
   } else if (page == WAIT_ARRIVAL) {
-    if (y >= 178) goHome(nullptr);
+    if (y >= 180) goHome(nullptr);
   } else if (page == PICK_INSPECTION) {
     for (uint8_t i = 0; i < inspection_count; ++i) {
-      int top = 86 + i * 40;
+      int top = 88 + i * 36;
       if (y >= top && y < top + 34) { selected_inspection = i; selectInspection(nullptr); return; }
     }
-    if (y >= 178) goHome(nullptr);
+    if (y >= 180) goHome(nullptr);
   } else if (page == INSPECTION_STATUS) {
     if ((task_status == "completed" || task_status == "failed") && y >= 178) goHome(nullptr);
   } else if (page == ERROR_PAGE) {
-    if (y >= 140 && y < 182) retry(nullptr);
-    else if (y >= 182) goHome(nullptr);
+    if (y >= 140 && y < 174) retry(nullptr);
+    else if (y >= 174) goHome(nullptr);
   }
+}
+
+static void removeLastUtf8Character(String &text) {
+  int index = text.length() - 1;
+  while (index > 0 && (static_cast<uint8_t>(text[index]) & 0xC0) == 0x80) --index;
+  text.remove(index);
+}
+
+static int circularSafeWidth(int y) {
+  const int radius = 116;
+  const int distance = abs(y - SCREEN_H / 2);
+  if (distance >= radius) return 0;
+  return 2 * sqrt(radius * radius - distance * distance) - 8;
+}
+
+static String localizedStatus(const String &status) {
+  if (status == "sending") return "发送中";
+  if (status == "queued") return "排队中";
+  if (status == "navigating") return "前往点位";
+  if (status == "arrived") return "已到达";
+  if (status == "running") return "巡检中";
+  if (status == "completed") return "已完成";
+  if (status == "failed") return "失败";
+  return status;
 }
 
 static void directText(const String &text, int y, uint8_t size = 1, uint16_t color = TFT_WHITE) {
-  tft.setTextSize(size);
+  String visible = text;
+  uint8_t actual_size = size;
+  tft.setFont(&fonts::efontCN_16);
+  const int max_width = max(80, min(216, circularSafeWidth(y)));
+  tft.setTextSize(actual_size);
+  while (actual_size > 1 && tft.textWidth(visible) > max_width) {
+    --actual_size;
+    tft.setTextSize(actual_size);
+  }
+  if (tft.textWidth(visible) > max_width) {
+    while (visible.length() > 3 && tft.textWidth(visible + "...") > max_width) removeLastUtf8Character(visible);
+    visible += "...";
+  }
   tft.setTextColor(color, TFT_BLACK);
   tft.setTextDatum(lgfx::middle_center);
-  tft.drawString(text, SCREEN_W / 2, y);
+  tft.drawString(visible, SCREEN_W / 2, y);
 }
 
 static void directButton(const String &text, int top) {
-  tft.fillRoundRect(10, top, 220, 34, 5, TFT_DARKGREY);
-  tft.drawRoundRect(10, top, 220, 34, 5, TFT_CYAN);
+  tft.fillRoundRect(40, top, 160, 34, 5, TFT_DARKGREY);
+  tft.drawRoundRect(40, top, 160, 34, 5, TFT_CYAN);
   directText(text, top + 17, 1, TFT_WHITE);
 }
 
+static void renderProvisioningQr(esp_qrcode_handle_t qr) {
+  const int qrSize = esp_qrcode_get_size(qr);
+  const int scale = 3;
+  const int quiet = 4;
+  const int side = (qrSize + quiet * 2) * scale;
+  const int left = (SCREEN_W - side) / 2;
+  const int top = 50;
+  tft.fillRect(left, top, side, side, TFT_WHITE);
+  for (int y = 0; y < qrSize; ++y) {
+    for (int x = 0; x < qrSize; ++x) {
+      if (esp_qrcode_get_module(qr, x, y)) tft.fillRect(left + (x + quiet) * scale, top + (y + quiet) * scale, scale, scale, TFT_BLACK);
+    }
+  }
+}
+
+static void drawProvisioningQr() {
+  String payload = "WIFI:T:nopass;S:" + provisioning.apSsid() + ";;";
+  esp_qrcode_config_t config = ESP_QRCODE_CONFIG_DEFAULT();
+  config.display_func = renderProvisioningQr;
+  config.max_qrcode_version = 3;
+  config.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+  esp_qrcode_generate(&config, payload.c_str());
+}
+
 static void renderDirectPage() {
-  tft.startWrite();
+  unsigned long started = millis();
   tft.fillScreen(TFT_BLACK);
-  if (page == HOME) {
-    directText("ROBOT INSPECTION", 16, 2, TFT_CYAN);
-    directText(WiFi.status() == WL_CONNECTED ? "Wi-Fi connected" : "Wi-Fi connecting...", 39);
-    if (WiFi.status() != WL_CONNECTED) directText("Connecting to network", 112);
-    else if (point_count == 0) directText("Loading points...", 112);
+  if (page == NETWORK_SETUP) {
+    ProvisioningState state = provisioning.state();
+    directText("网络配置", 31, 1, TFT_CYAN);
+    if (state == PROVISION_AP) {
+      drawProvisioningQr();
+      directText(provisioning.apSsid(), 180, 1, TFT_WHITE);
+      directText("扫码加入热点", 198, 1, TFT_WHITE);
+      directText("192.168.4.1", 216, 1, TFT_CYAN);
+    } else if (state == PROVISION_VERIFYING) {
+      directText("正在验证 Wi-Fi", 86, 1, TFT_YELLOW);
+      directText(provisioning.candidateSsid(), 115, 1, TFT_WHITE);
+      directText("请保持手机连接热点", 145, 1, TFT_WHITE);
+      directText("192.168.4.1", 190, 1, TFT_CYAN);
+    } else if (state == PROVISION_SUCCESS) {
+      directText("配置成功", 100, 1, TFT_GREEN);
+      directText(provisioning.message(), 135, 1, TFT_WHITE);
+    } else {
+      directText("连接失败", 88, 1, TFT_RED);
+      directText(provisioning.message(), 120, 1, TFT_WHITE);
+      directText("192.168.4.1", 170, 1, TFT_CYAN);
+      directText("请返回网页重试", 200, 1, TFT_WHITE);
+    }
+  } else if (page == HOME) {
+    directText("智巡精灵 v1.0", 36, 1, TFT_CYAN);
+    directText(WiFi.status() == WL_CONNECTED ? "Wi-Fi 已连接" : "Wi-Fi 连接中...", 58);
+    if (WiFi.status() != WL_CONNECTED) {
+      directText(provisioning.message(), 112);
+      directButton("配置网络", 170);
+    }
+    else if (point_count == 0) directText("正在加载点位...", 112);
     else {
-      directText("Select an inspection point", 61);
-      for (uint8_t i = 0; i < point_count; ++i) directButton(points[i].name, 82 + i * 38);
+      directText("请选择巡检点位", 76);
+      for (uint8_t i = 0; i < point_count; ++i) directButton(points[i].name, 86 + i * 36);
     }
   } else if (page == CONFIRM_CALL) {
-    directText("CONFIRM ROBOT CALL", 24, 2, TFT_YELLOW);
-    directText("Call robot to:", 66);
-    directText(points[selected_point].name, 91, 2, TFT_CYAN);
-    directText("Robot will travel to this point", 122);
-    directButton("Confirm call", 144);
-    directButton("Back", 184);
+    directText("确认呼叫", 42, 1, TFT_YELLOW);
+    directText("机器人前往", 70);
+    directText(points[selected_point].name, 94, 1, TFT_CYAN);
+    directText("确认后机器人将前往该点位", 116);
+    directButton("确认呼叫", 140);
+    directButton("返回", 180);
   } else if (page == WAIT_ARRIVAL) {
-    directText("ROBOT STATUS", 24, 2, TFT_CYAN);
-    directText(points[selected_point].name, 60);
-    directText(task_status, 106, 2, TFT_YELLOW);
+    directText("机器人状态", 42, 1, TFT_CYAN);
+    directText(points[selected_point].name, 70);
+    directText(localizedStatus(task_status), 108, 1, TFT_YELLOW);
     directText(task_message, 136);
-    directButton("Cancel / Back", 184);
+    directButton("取消 / 返回", 180);
   } else if (page == PICK_INSPECTION) {
-    directText("ROBOT ARRIVED", 22, 2, TFT_GREEN);
-    directText("Select an inspection", 54);
-    for (uint8_t i = 0; i < inspection_count; ++i) directButton(inspections[i].name, 86 + i * 40);
-    directButton("Back", 184);
+    directText("机器人已到达", 42, 1, TFT_GREEN);
+    if (inspection_count == 0) directText("正在加载巡检项目...", 112);
+    else {
+      directText("请选择巡检项目", 70);
+      for (uint8_t i = 0; i < inspection_count; ++i) directButton(inspections[i].name, 88 + i * 36);
+    }
+    directButton("返回", 180);
   } else if (page == INSPECTION_STATUS) {
-    directText("INSPECTION STATUS", 24, 2, TFT_CYAN);
-    directText(selected_inspection >= 0 ? inspections[selected_inspection].name : "Inspection", 58);
-    directText(task_status, 106, 2, TFT_YELLOW);
+    directText("巡检状态", 42, 1, TFT_CYAN);
+    directText(selected_inspection >= 0 ? inspections[selected_inspection].name : "巡检项目", 70);
+    directText(localizedStatus(task_status), 108, 1, TFT_YELLOW);
     directText(task_message, 136);
-    if (task_status == "completed" || task_status == "failed") directButton("Done", 184);
+    if (task_status == "completed" || task_status == "failed") directButton("完成", 180);
   } else {
-    directText("CONNECTION ERROR", 34, 2, TFT_RED);
-    directText(error_message, 112);
-    directButton("Retry", 144);
-    directButton("Return home", 184);
+    directText("连接错误", 48, 1, TFT_RED);
+    directText(error_message, 108);
+    directButton("重试", 140);
+    directButton("返回首页", 180);
   }
-  tft.endWrite();
+  LOGI("Direct render page=%s elapsed=%lu ms", pageName(page), millis() - started);
 }
 
 static void buildHome() {
-  label("ROBOT INSPECTION", LV_ALIGN_TOP_MID, 0, 10, &lv_font_montserrat_16);
+  label("智巡精灵 v1.0", LV_ALIGN_TOP_MID, 0, 10, &lv_font_montserrat_16);
   String network = WiFi.status() == WL_CONNECTED ? "Wi-Fi connected" : "Wi-Fi offline";
   label(network.c_str(), LV_ALIGN_TOP_MID, 0, 34);
   label("Select an inspection point", LV_ALIGN_TOP_MID, 0, 56);
@@ -359,19 +468,45 @@ static void showPage(Page next) {
   LOGI("UI page %s -> %s", pageName(page), pageName(next));
   page = next;
   last_poll = millis();
-  if (page == HOME && WiFi.status() == WL_CONNECTED && point_count == 0 && !fetchPoints()) page = ERROR_PAGE;
-  if (page == PICK_INSPECTION && inspection_count == 0 && !fetchInspections()) page = ERROR_PAGE;
   renderDirectPage();
+  if (page == HOME && provisioning.isNormal() && WiFi.status() == WL_CONNECTED && point_count == 0) scheduleAction(LOAD_POINTS);
+  if (page == PICK_INSPECTION && inspection_count == 0) scheduleAction(LOAD_INSPECTIONS);
+}
+
+static void scheduleAction(PendingAction action) {
+  pending_action = action;
+  pending_action_since = millis();
+  LOGI("Scheduled network action=%d", action);
+}
+
+static void runPendingAction() {
+  PendingAction action = pending_action;
+  pending_action = NO_ACTION;
+  bool ok = false;
+
+  if (action == LOAD_POINTS && page == HOME) ok = fetchPoints();
+  else if (action == LOAD_INSPECTIONS && page == PICK_INSPECTION) ok = fetchInspections();
+  else if (action == SEND_NAVIGATION && page == WAIT_ARRIVAL) ok = createNavigation();
+  else if (action == SEND_INSPECTION && page == INSPECTION_STATUS) ok = createInspection();
+  else return;
+
+  showPage(ok ? page : ERROR_PAGE);
 }
 
 void setup() {
+  pinMode(3, OUTPUT); digitalWrite(3, LOW);
   Serial.begin(115200); delay(300);
   LOGI("Boot: Robot inspection panel");
   LOGI("Config: device=%s site=%s backend=%s", PANEL_DEVICE_ID, PANEL_SITE_ID, BACKEND_URL);
-  pinMode(3, OUTPUT); digitalWrite(3, HIGH);
   tft.init();
+  tft.initDMA();
   tft.fillScreen(TFT_BLACK);
+  // Keep the GC9A01 SPI transaction open, matching the vendor LVGL example.
+  // Re-opening it for the first direct frame can block for several seconds.
+  tft.startWrite();
   touch.begin(); lv_init();
+  // CST816D uses INT as a startup pulse, then drives it itself.
+  pinMode(0, INPUT);
   LOGI("Display initialized; CST816D I2C probe at 0x15: %s", touch.isConnected() ? "found" : "NOT FOUND");
   display = lv_display_create(SCREEN_W, SCREEN_H);
   lv_display_set_buffers(display, draw_a, draw_b, sizeof(draw_a), LV_DISPLAY_RENDER_MODE_PARTIAL);
@@ -386,10 +521,11 @@ void setup() {
   lv_indev_set_type(touch_input, LV_INDEV_TYPE_POINTER);
   lv_indev_set_display(touch_input, display);
   lv_indev_set_read_cb(touch_input, [](lv_indev_t *, lv_indev_data_t *data) { static bool was_pressed = false; uint16_t x, y; uint8_t gesture; ++touch_input_reads; if (touch.getTouch(&x, &y, &gesture)) { data->state = LV_INDEV_STATE_PRESSED; data->point.x = x; data->point.y = y; if (!was_pressed) LOGI("LVGL touch x=%u y=%u gesture=%u", x, y, gesture); was_pressed = true; } else { data->state = LV_INDEV_STATE_RELEASED; was_pressed = false; } });
-  LOGI("Wi-Fi connecting to SSID '%s'", WIFI_SSID); WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   screen = lv_obj_create(nullptr); lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_style_pad_all(screen, 8, 0); lv_screen_load(screen);
+  provisioning.begin(WIFI_SSID, WIFI_PASSWORD, BACKEND_URL, PANEL_DEVICE_ID);
   showPage(HOME);
-  lv_refr_now(display);
+  digitalWrite(3, HIGH);
+  LOGI("Wi-Fi provisioning state started");
 }
 
 void loop() {
@@ -401,7 +537,28 @@ void loop() {
     handleRawTap(raw_x, raw_y);
   }
   raw_touch_pressed = raw_touched;
-  if (page == HOME && point_count == 0 && WiFi.status() == WL_CONNECTED && millis() - last_home_refresh >= 1000) {
+  if (page == HOME && provisioning.isNormal() && raw_touched && raw_y <= 64) {
+    if (!title_hold_since) title_hold_since = millis();
+    if (!title_hold_triggered && millis() - title_hold_since >= 5000) {
+      title_hold_triggered = true;
+      provisioning.startPortal();
+      page = NETWORK_SETUP;
+      renderDirectPage();
+    }
+  } else {
+    title_hold_since = 0;
+    title_hold_triggered = false;
+  }
+  provisioning.loop();
+  if (provisioning.needsRender()) {
+    if (provisioning.isPortal()) page = NETWORK_SETUP;
+    else if (page == NETWORK_SETUP) { page = HOME; point_count = 0; }
+    renderDirectPage();
+    provisioning.clearRenderRequest();
+    if (page == HOME && provisioning.isNormal() && point_count == 0) scheduleAction(LOAD_POINTS);
+  }
+  if (pending_action != NO_ACTION && millis() - pending_action_since >= 50) runPendingAction();
+  if (page == HOME && provisioning.isNormal() && point_count == 0 && WiFi.status() == WL_CONNECTED && millis() - last_home_refresh >= 1000) {
     last_home_refresh = millis();
     LOGI("Wi-Fi connected IP=%s RSSI=%d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
     showPage(HOME);

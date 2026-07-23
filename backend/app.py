@@ -55,12 +55,12 @@ class Task:
     updated_at: float
 
 
-POINTS = [Point(id="lobby", name="Lobby"), Point(id="warehouse", name="Warehouse"), Point(id="line-1", name="Line 1")]
-INSPECTIONS = [InspectionOption(id="general", name="General inspection")]
+POINTS = [Point(id="lobby", name="大厅"), Point(id="warehouse", name="仓库"), Point(id="line-1", name="一号产线")]
+INSPECTIONS = [InspectionOption(id="general", name="常规巡检")]
 TASKS: dict[str, Task] = {}
 EVENTS: dict[str, str] = {}
 API_TOKEN = os.getenv("ROBOT_PANEL_API_TOKEN", "")
-app = FastAPI(title="Robot Inspection Panel Simulator", version="1.0.0")
+app = FastAPI(title="智巡精灵 v1.0", version="1.0.0")
 
 
 def authorize(token: str | None) -> None:
@@ -77,15 +77,15 @@ class RobotAdapter:
 
     async def navigate(self, task_id: str) -> None:
         await asyncio.sleep(1)
-        update(task_id, "navigating", "Robot is travelling to the point")
+        update(task_id, "navigating", "机器人正在前往点位")
         await asyncio.sleep(3)
-        update(task_id, "arrived", "Robot has arrived")
+        update(task_id, "arrived", "机器人已到达")
 
     async def inspect(self, task_id: str) -> None:
         await asyncio.sleep(1)
-        update(task_id, "running", "General inspection in progress")
+        update(task_id, "running", "正在执行常规巡检")
         await asyncio.sleep(3)
-        update(task_id, "completed", "Inspection completed")
+        update(task_id, "completed", "巡检已完成")
 
 
 robot = RobotAdapter()
@@ -115,7 +115,7 @@ def health() -> dict:
 @app.get("/api/panels/{device_id}/config")
 def panel_config(device_id: str, x_api_token: str | None = Header(default=None)) -> dict:
     authorize(x_api_token)
-    return {"device_id": device_id, "site_id": "site-a", "site_name": "Main Entrance", "points": [p.model_dump() for p in POINTS]}
+    return {"device_id": device_id, "site_id": "site-a", "site_name": "主入口", "points": [p.model_dump() for p in POINTS]}
 
 
 @app.get("/api/points/{point_id}/inspections")
@@ -131,7 +131,7 @@ async def create_navigation(request: NavigateRequest, x_api_token: str | None = 
     authorize(x_api_token)
     if request.point_id not in {p.id for p in POINTS}:
         raise HTTPException(422, "unknown point")
-    task, is_new = create(request.event_id, "navigate", request.device_id, request.point_id, "Navigation queued")
+    task, is_new = create(request.event_id, "navigate", request.device_id, request.point_id, "导航任务已排队")
     if is_new:
         asyncio.create_task(robot.navigate(task.id))
     return response(task)
@@ -147,7 +147,7 @@ async def create_inspection(request: InspectionRequest, x_api_token: str | None 
         raise HTTPException(409, "robot has not arrived")
     if request.inspection_id not in {item.id for item in INSPECTIONS}:
         raise HTTPException(422, "unknown inspection")
-    task, is_new = create(request.event_id, "inspection", request.device_id, arrival.point_id, "Inspection queued")
+    task, is_new = create(request.event_id, "inspection", request.device_id, arrival.point_id, "巡检任务已排队")
     if is_new:
         asyncio.create_task(robot.inspect(task.id))
     return response(task)
