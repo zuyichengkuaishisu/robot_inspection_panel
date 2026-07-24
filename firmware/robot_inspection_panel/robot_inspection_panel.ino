@@ -4,7 +4,6 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
-#include <lvgl.h>
 #include <LovyanGFX.hpp>
 #include <qrcode.h>
 
@@ -14,7 +13,6 @@
 
 static constexpr uint16_t SCREEN_W = 240;
 static constexpr uint16_t SCREEN_H = 240;
-static constexpr uint8_t DRAW_ROWS = 24;
 static constexpr uint8_t MAX_POINTS = 20;
 static constexpr uint8_t MAX_INSPECTIONS = 4;
 static constexpr unsigned long POLL_INTERVAL_MS = 1000;
@@ -54,11 +52,6 @@ LGFX tft;
 LGFX_Sprite point_list_canvas(&tft);
 CST816D touch(4, 5, 1, 0);
 ProvisioningPortal provisioning;
-static lv_color_t draw_a[SCREEN_W * DRAW_ROWS];
-static lv_color_t draw_b[SCREEN_W * DRAW_ROWS];
-static lv_display_t *display;
-static lv_obj_t *screen;
-static lv_indev_t *touch_input;
 static Page page = HOME;
 static Option points[MAX_POINTS], inspections[MAX_INSPECTIONS];
 static uint8_t point_count = 0, inspection_count = 0;
@@ -68,7 +61,6 @@ static unsigned long last_poll = 0;
 static unsigned long last_touch_diagnostic = 0;
 static unsigned long last_home_refresh = 0;
 static int previous_touch_count = -2;
-static uint32_t touch_input_reads = 0;
 static bool raw_touch_pressed = false;
 static unsigned long last_raw_tap_ms = 0;
 static unsigned long title_hold_since = 0;
@@ -214,40 +206,22 @@ static bool pollTask() {
   return true;
 }
 
-static lv_obj_t *label(const char *text, lv_align_t align, int x, int y, const lv_font_t *font = nullptr) {
-  lv_obj_t *obj = lv_label_create(screen); lv_label_set_text(obj, text);
-  lv_obj_set_width(obj, 216); lv_label_set_long_mode(obj, LV_LABEL_LONG_WRAP);
-  lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, 0);
-  if (font) lv_obj_set_style_text_font(obj, font, 0);
-  lv_obj_align(obj, align, x, y); return obj;
-}
-
-static lv_obj_t *button(const char *text, lv_align_t align, int x, int y, lv_event_cb_t callback, void *data = nullptr) {
-  lv_obj_t *btn = lv_btn_create(screen); lv_obj_set_size(btn, 204, 34); lv_obj_align(btn, align, x, y);
-  lv_obj_add_event_cb(btn, callback, LV_EVENT_CLICKED, data);
-  lv_obj_t *txt = lv_label_create(btn); lv_label_set_text(txt, text); lv_obj_center(txt);
-  return btn;
-}
-
-static void goHome(lv_event_t *) { LOGI("UI: return home"); selected_point = -1; selected_inspection = -1; task_id = ""; showPage(HOME); }
-static void retry(lv_event_t *) { LOGI("UI: retry from %s", pageName(page)); showPage(page == ERROR_PAGE ? HOME : page); }
-static void selectPoint(lv_event_t *e) { selected_point = (intptr_t)lv_event_get_user_data(e); LOGI("UI: selected point=%s", points[selected_point].id); showPage(CONFIRM_CALL); }
-static void confirmCall(lv_event_t *) {
+static void goHome() { LOGI("UI: return home"); selected_point = -1; selected_inspection = -1; task_id = ""; showPage(HOME); }
+static void retry() { LOGI("UI: retry from %s", pageName(page)); showPage(page == ERROR_PAGE ? HOME : page); }
+static void confirmCall() {
   LOGI("UI: call confirmed");
   task_status = "sending"; task_message = "正在发送机器人呼叫";
   showPage(WAIT_ARRIVAL);
   scheduleAction(SEND_NAVIGATION);
 }
-static void selectInspection(lv_event_t *e) {
-  if (e) selected_inspection = (intptr_t)lv_event_get_user_data(e);
+static void selectInspection() {
   LOGI("UI: selected inspection=%s", inspections[selected_inspection].id);
   task_status = "sending"; task_message = "正在启动巡检";
   showPage(INSPECTION_STATUS);
   scheduleAction(SEND_INSPECTION);
 }
 
-// Fallback dispatcher for the CST816D. It keeps the panel usable if LVGL's
-// input timer is not scheduled by the Arduino LVGL build.
+// Direct touch dispatcher for the CST816D-driven UI.
 static void handleRawTap(uint16_t x, uint16_t y) {
   LOGI("Raw tap x=%u y=%u page=%s", x, y, pageName(page));
   if (page == HOME) {
@@ -288,21 +262,21 @@ static void handleRawTap(uint16_t x, uint16_t y) {
       }
     }
   } else if (page == CONFIRM_CALL) {
-    if (y >= 140 && y < 174) { confirmCall(nullptr); return; }
-    if (y >= 174) { goHome(nullptr); return; }
+    if (y >= 140 && y < 174) { confirmCall(); return; }
+    if (y >= 174) { goHome(); return; }
   } else if (page == WAIT_ARRIVAL) {
-    if (y >= 180) goHome(nullptr);
+    if (y >= 180) goHome();
   } else if (page == PICK_INSPECTION) {
     for (uint8_t i = 0; i < inspection_count; ++i) {
       int top = 88 + i * 36;
-      if (y >= top && y < top + 34) { selected_inspection = i; selectInspection(nullptr); return; }
+      if (y >= top && y < top + 34) { selected_inspection = i; selectInspection(); return; }
     }
-    if (y >= 180) goHome(nullptr);
+    if (y >= 180) goHome();
   } else if (page == INSPECTION_STATUS) {
-    if ((task_status == "completed" || task_status == "failed") && y >= 178) goHome(nullptr);
+    if ((task_status == "completed" || task_status == "failed") && y >= 178) goHome();
   } else if (page == ERROR_PAGE) {
-    if (y >= 140 && y < 174) retry(nullptr);
-    else if (y >= 174) goHome(nullptr);
+    if (y >= 140 && y < 174) retry();
+    else if (y >= 174) goHome();
   }
 }
 
@@ -500,59 +474,6 @@ static void renderDirectPage() {
   LOGI("Direct render page=%s elapsed=%lu ms", pageName(page), millis() - started);
 }
 
-static void buildHome() {
-  label("智巡精灵 v1.0", LV_ALIGN_TOP_MID, 0, 10, &lv_font_montserrat_16);
-  String network = WiFi.status() == WL_CONNECTED ? "Wi-Fi connected" : "Wi-Fi offline";
-  label(network.c_str(), LV_ALIGN_TOP_MID, 0, 34);
-  label("Select an inspection point", LV_ALIGN_TOP_MID, 0, 56);
-  if (WiFi.status() != WL_CONNECTED) {
-    label("Wi-Fi connecting...", LV_ALIGN_CENTER, 0, 0);
-    return;
-  }
-  if (!fetchPoints()) { label(error_message.c_str(), LV_ALIGN_CENTER, 0, 0); button("Retry", LV_ALIGN_BOTTOM_MID, 0, -14, retry); return; }
-  for (uint8_t i = 0; i < point_count; ++i) button(points[i].name, LV_ALIGN_TOP_MID, 0, 82 + i * 38, selectPoint, (void *)(intptr_t)i);
-}
-
-static void buildConfirm() {
-  label("CONFIRM ROBOT CALL", LV_ALIGN_TOP_MID, 0, 24, &lv_font_montserrat_16);
-  label("Call the robot to:", LV_ALIGN_TOP_MID, 0, 64);
-  label(points[selected_point].name, LV_ALIGN_TOP_MID, 0, 90, &lv_font_montserrat_16);
-  label("The robot will travel to this point.", LV_ALIGN_TOP_MID, 0, 122);
-  button("Confirm call", LV_ALIGN_BOTTOM_MID, 0, -54, confirmCall);
-  button("Back", LV_ALIGN_BOTTOM_MID, 0, -14, goHome);
-}
-
-static void buildWait() {
-  label("ROBOT STATUS", LV_ALIGN_TOP_MID, 0, 24, &lv_font_montserrat_16);
-  label(points[selected_point].name, LV_ALIGN_TOP_MID, 0, 60);
-  label(task_status.c_str(), LV_ALIGN_CENTER, 0, -18, &lv_font_montserrat_16);
-  label(task_message.c_str(), LV_ALIGN_CENTER, 0, 18);
-  button("Cancel / Back", LV_ALIGN_BOTTOM_MID, 0, -14, goHome);
-}
-
-static void buildPickInspection() {
-  label("ROBOT ARRIVED", LV_ALIGN_TOP_MID, 0, 22, &lv_font_montserrat_16);
-  label("Select an inspection", LV_ALIGN_TOP_MID, 0, 54);
-  if (!fetchInspections()) { label(error_message.c_str(), LV_ALIGN_CENTER, 0, 0); button("Back", LV_ALIGN_BOTTOM_MID, 0, -14, goHome); return; }
-  for (uint8_t i = 0; i < inspection_count; ++i) button(inspections[i].name, LV_ALIGN_TOP_MID, 0, 86 + i * 40, selectInspection, (void *)(intptr_t)i);
-  button("Back", LV_ALIGN_BOTTOM_MID, 0, -14, goHome);
-}
-
-static void buildInspectionStatus() {
-  label("INSPECTION STATUS", LV_ALIGN_TOP_MID, 0, 24, &lv_font_montserrat_16);
-  label(selected_inspection >= 0 ? inspections[selected_inspection].name : "Inspection", LV_ALIGN_TOP_MID, 0, 58);
-  label(task_status.c_str(), LV_ALIGN_CENTER, 0, -18, &lv_font_montserrat_16);
-  label(task_message.c_str(), LV_ALIGN_CENTER, 0, 18);
-  if (task_status == "completed" || task_status == "failed") button("Done", LV_ALIGN_BOTTOM_MID, 0, -14, goHome);
-}
-
-static void buildError() {
-  label("CONNECTION ERROR", LV_ALIGN_TOP_MID, 0, 34, &lv_font_montserrat_16);
-  label(error_message.c_str(), LV_ALIGN_CENTER, 0, -4);
-  button("Retry", LV_ALIGN_BOTTOM_MID, 0, -54, retry);
-  button("Return home", LV_ALIGN_BOTTOM_MID, 0, -14, goHome);
-}
-
 static void showPage(Page next) {
   LOGI("UI page %s -> %s", pageName(page), pageName(next));
   page = next;
@@ -588,7 +509,6 @@ void setup() {
   LOGI("Boot: Robot inspection panel");
   LOGI("Config: device=%s site=%s backend=%s", PANEL_DEVICE_ID, PANEL_SITE_ID, BACKEND_URL);
   tft.init();
-  tft.initDMA();
   tft.fillScreen(TFT_BLACK);
   point_list_canvas.setColorDepth(lgfx::palette_2bit);
   point_list_canvas_ready = point_list_canvas.createSprite(POINT_VIEW_W, POINT_VIEW_H) != nullptr;
@@ -599,27 +519,13 @@ void setup() {
     point_list_canvas.setPaletteColor(3, 0xFFFFFFU);
   }
   LOGI("Point list canvas: %s (%dx%d, 2-bit)", point_list_canvas_ready ? "ready" : "allocation failed", POINT_VIEW_W, POINT_VIEW_H);
-  // Keep the GC9A01 SPI transaction open, matching the vendor LVGL example.
-  // Re-opening it for the first direct frame can block for several seconds.
+  // Keep the GC9A01 SPI transaction open; reopening it before the first direct
+  // frame can block for several seconds on this panel.
   tft.startWrite();
-  touch.begin(); lv_init();
+  touch.begin();
   // CST816D uses INT as a startup pulse, then drives it itself.
   pinMode(0, INPUT);
   LOGI("Display initialized; CST816D I2C probe at 0x15: %s", touch.isConnected() ? "found" : "NOT FOUND");
-  display = lv_display_create(SCREEN_W, SCREEN_H);
-  lv_display_set_buffers(display, draw_a, draw_b, sizeof(draw_a), LV_DISPLAY_RENDER_MODE_PARTIAL);
-  lv_display_set_flush_cb(display, [](lv_display_t *d, const lv_area_t *a, uint8_t *pixels) {
-    // Synchronous transfer avoids stale frames observed with GC9A01 DMA.
-    tft.startWrite();
-    tft.pushImage(a->x1, a->y1, lv_area_get_width(a), lv_area_get_height(a), (lgfx::swap565_t *)pixels);
-    tft.endWrite();
-    lv_display_flush_ready(d);
-  });
-  touch_input = lv_indev_create();
-  lv_indev_set_type(touch_input, LV_INDEV_TYPE_POINTER);
-  lv_indev_set_display(touch_input, display);
-  lv_indev_set_read_cb(touch_input, [](lv_indev_t *, lv_indev_data_t *data) { static bool was_pressed = false; uint16_t x, y; uint8_t gesture; ++touch_input_reads; if (touch.getTouch(&x, &y, &gesture)) { data->state = LV_INDEV_STATE_PRESSED; data->point.x = x; data->point.y = y; if (!was_pressed) LOGI("LVGL touch x=%u y=%u gesture=%u", x, y, gesture); was_pressed = true; } else { data->state = LV_INDEV_STATE_RELEASED; was_pressed = false; } });
-  screen = lv_obj_create(nullptr); lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_style_pad_all(screen, 8, 0); lv_screen_load(screen);
   provisioning.begin(BACKEND_URL, PANEL_DEVICE_ID);
   showPage(HOME);
   digitalWrite(3, HIGH);
@@ -659,8 +565,7 @@ void loop() {
         if (abs(delta) >= 8) {
           point_scroll_moved = true;
           int16_t new_scroll = point_scroll_anchor + delta;
-          int max_scroll = (int16_t)point_count * 38 - (230 - 78);
-          if (max_scroll < 0) max_scroll = 0;
+          int max_scroll = pointMaxScroll();
           if (new_scroll < 0) new_scroll = 0;
           if (new_scroll > max_scroll) new_scroll = max_scroll;
           if (new_scroll != point_scroll) {
@@ -676,8 +581,7 @@ void loop() {
         point_release_since = millis();
       } else if (millis() - point_release_since >= 40) {
         if (!point_scroll_moved && (point_scroll_gesture == 1 || point_scroll_gesture == 2)) {
-          int max_scroll = (int16_t)point_count * 38 - (230 - 78);
-          if (max_scroll < 0) max_scroll = 0;
+          int max_scroll = pointMaxScroll();
           point_scroll += point_scroll_gesture == 1 ? 114 : -114;
           if (point_scroll < 0) point_scroll = 0;
           if (point_scroll > max_scroll) point_scroll = max_scroll;

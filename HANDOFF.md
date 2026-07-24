@@ -11,7 +11,7 @@
 - 后端运行于 `http://192.168.0.35:8765`.
 - 配网成功后面板 IP: `192.168.0.26`.
 - 分区方案: `huge_app`（关闭 OTA，给应用 ~3 MB 空间）.
-- Flash 使用: ~59%, RAM: ~63%.
+- Flash 使用: ~50%, RAM: ~13%.
 
 ## 用户操作流程
 
@@ -105,7 +105,7 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 
 ### 圆屏 UI 渲染
 
-- **渲染引擎**：LovyanGFX 直接渲染（LVGL 初始化但未用于实际页面）。原因是 LVGL 路径在 GC9A01 上留下残影。
+- **渲染引擎**：LovyanGFX 直接渲染。点位列表使用 176×170 的 2-bit 离屏画布一次性推送可视区，避免滑动时整屏闪烁。
 - **字体**：`efontCN_16`（中文字体），`setTextDatum(middle_center)` 居中绘制。
 - **安全区**：圆形屏幕中，`circularSafeWidth(y)` 计算给定 y 坐标的安全水平宽度（根据圆方程 `2*sqrt(120²-(y-120)²)`），避免文字超出圆形边缘。
 - **自适应字号**：`directText()` 在文字超宽时自动缩小字号或截断加省略号。
@@ -145,26 +145,11 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 
 **注意**：`Serial.printf` 在 USB CDC 模式下可能阻塞，所有日志语句都已检查 `Serial.availableForWrite()`。
 
-## 已知问题与待修复
+## 已知约束
 
-### 1. **配网热点二次连接问题** ✅ 已解决
-
-**解决方案**：切换为 **纯 AP 模式**（`WIFI_AP`），消除 `WIFI_AP_STA` 混合模式下的信道冲突和 STA 自动重连干扰。
-
-变更要点：
-- 启动时扫描 8 秒，无已保存配置则自动进入纯 AP 模式
-- 验证凭据时临时切到 `WIFI_STA` 测试连接，失败后恢复 `WIFI_AP`
-- 移除 NVS `portal` 持久化标志，不再跨重启保持配网状态
-- 连接成功后写入 NVS 并重启进入 STA 模式
-
-### 2. **渲染性能与内容裁切**
-
-- 已优化：`tft.startWrite()` 在 `setup()` 中保持 SPI 事务打开，避免首帧 2-3 秒阻塞。
-- 部分文字在圆形边界附近的 y 坐标上可能超出屏幕边缘（用户曾反馈"检查显示内容，有的已经超过边缘"）。`circularSafeWidth()` 需要验证各页面 y 值对应的安全宽度。
-
-### 3. **后端模拟器替换**
-
-当前 `RobotAdapter` 是睡眠等待模拟。接入真实机器人时需要保留面板侧 API 和 event_id 幂等性。
+- 使用 `huge_app` 分区，因此当前不支持 OTA。
+- `RobotAdapter` 是睡眠等待模拟。接入真实机器人时需要保留面板侧 API 和 `event_id` 幂等性。
+- 新增页面内容时需继续通过 `circularSafeWidth()` 校验圆屏边界。
 
 ## 编译与烧录
 
@@ -196,14 +181,7 @@ Swagger 文档：`http://192.168.0.35:8765/docs`。后端地址变化时同步�
 
 ## 下一步功能
 
-1. **修复配网热点二次连接问题**（当前阻塞项）
-2. **后端状态页面** — 查看当前 NVS 配置、设备 ID、固件版本
-3. **无线 OTA** — 免 USB 更新固件
-4. **真实机器人 HTTP 适配器** — 替换 `RobotAdapter` 模拟器
-5. **多语言支持** — 后端巡检点位提供 `name_zh` 字段
-
-## Git 状态
-
-- 最新提交: `5f0d4aa docs: 新增机器人巡检面板交接文档`
-- 未提交修改: `backend/app.py`, `firmware/.../robot_inspection_panel.ino`, `README.md`, `HANDOFF.md` + 新增 `ProvisioningPortal.h`, `ProvisioningPortal.cpp`
-- 分支前缀: `codex/`
+1. **后端状态页面** — 查看当前 NVS 配置、设备 ID、固件版本
+2. **无线 OTA** — 需要调整当前 `huge_app` 分区方案
+3. **真实机器人 HTTP 适配器** — 替换 `RobotAdapter` 模拟器
+4. **多语言支持** — 后端巡检点位提供语言字段

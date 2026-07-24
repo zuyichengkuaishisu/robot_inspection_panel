@@ -9,10 +9,11 @@ cd backend
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port 8000
+uvicorn app:app --host 0.0.0.0 --port 8765
 ```
 
 Set `ROBOT_PANEL_API_TOKEN` only when a panel token is also configured in `firmware/robot_inspection_panel/config.h`.
+Swagger documentation is available at `http://<backend-host>:8765/docs`.
 
 ## Wi-Fi Provisioning
 
@@ -32,4 +33,8 @@ Edit `firmware/robot_inspection_panel/config.h`, especially `BACKEND_URL` (use t
 arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=huge_app firmware/robot_inspection_panel
 ```
 
-Required Arduino libraries are LovyanGFX, LVGL 9, ArduinoJson and QRCode. `huge_app` is required because the UI and Wi-Fi HTTP client exceed the default 1.2 MB application partition; it disables OTA updates. The panel flow is point selection, call confirmation, arrival polling, inspection selection, then inspection polling.
+Required Arduino libraries are LovyanGFX, ArduinoJson and QRCode. `huge_app` is required because the UI and Wi-Fi HTTP client exceed the default 1.2 MB application partition; it disables OTA updates. The panel flow is point selection, call confirmation, arrival polling, inspection selection, then inspection polling.
+
+## Hardware references
+
+`1.28inch_ESP32-2424S012/` contains the board specification, schematic, mechanical drawings, chip datasheet, user manual and a minimal display example. Third-party library copies and vendor Windows utilities are intentionally excluded; install Arduino libraries through the normal Arduino library workflow.

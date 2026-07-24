@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Arduino build output
+build/
+*.bin
+*.elf
+*.map
+
+# Local configuration and editor files
+.idea/
+.vscode/
+.DS_Store
+firmware/robot_inspection_panel/config.h
