@@ -1,6 +1,8 @@
-# 智巡精灵 v1.0
+# 智巡精灵 v1.1
 
 Independent project for the ESP32-2424S012 (240x240 GC9A01 display, CST816D touch).
+
+The panel manages one robot dog with global idle/busy state, delivery and inspection workflows. Delivery calls the robot to a pickup point, waits for loading, travels to a separate destination, then completes on unload confirmation or after a two-minute timeout.
 
 ## Backend
 
@@ -13,7 +15,15 @@ uvicorn app:app --host 0.0.0.0 --port 8765
 ```
 
 Set `ROBOT_PANEL_API_TOKEN` only when a panel token is also configured in `firmware/robot_inspection_panel/config.h`.
+Set `DELIVERY_UNLOAD_TIMEOUT_SECONDS` to override the default 120-second unload timeout.
 Swagger documentation is available at `http://<backend-host>:8765/docs`.
+
+Run backend tests with:
+
+```bash
+cd backend
+.venv/bin/python -m unittest -v test_app.py
+```
 
 ## Wi-Fi Provisioning
 
@@ -23,7 +33,7 @@ Connect a phone to the hotspot. The panel displays a QR code for easy joining, a
 
 After submitting, the panel switches to STA mode, connects to the target network, and checks the backend `/health` endpoint. On success the configuration is saved to NVS and the panel restarts; on failure the AP portal remains open for another attempt. A backend warning does not prevent saving the Wi-Fi configuration.
 
-The panel operates in **pure AP-only mode** during provisioning — no mixed STA/AP mode. After a successful provision it restarts and connects as a Wi-Fi station. To reprovision from an already-connected state, hold the title bar for five seconds on the home page.
+The panel operates in **pure AP-only mode** during provisioning — no mixed STA/AP mode. After a successful provision it restarts and connects as a Wi-Fi station. To reprovision from an already-connected state, use the visible Network Configuration button on the home page.
 
 ## Firmware
 
@@ -33,7 +43,7 @@ Edit `firmware/robot_inspection_panel/config.h`, especially `BACKEND_URL` (use t
 arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=huge_app firmware/robot_inspection_panel
 ```
 
-Required Arduino libraries are LovyanGFX, ArduinoJson and QRCode. `huge_app` is required because the UI and Wi-Fi HTTP client exceed the default 1.2 MB application partition; it disables OTA updates. The panel flow is point selection, call confirmation, arrival polling, inspection selection, then inspection polling.
+Required Arduino libraries are LovyanGFX, ArduinoJson and QRCode. `huge_app` is required because the UI and Wi-Fi HTTP client exceed the default 1.2 MB application partition; it disables OTA updates. The home page shows the robot state and location, with separate Delivery, Inspection and Network Configuration entries.
 
 ## Hardware references
 

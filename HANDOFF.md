@@ -1,8 +1,8 @@
-# 智巡精灵 v1.0 Handoff
+# 智巡精灵 v1.1 Handoff
 
 ## Current State
 
-- 主分支基线: `091071c chore: trim vendor hardware resources`.
+- 主分支基线: `d38dea0 docs: refresh project handoff`，其后为本次 v1.1 功能修改.
 - Target: ESP32-2424S012, ESP32-C3 (单核 160 MHz), 4 MB flash.
 - 屏幕: GC9A01 圆形 240×240, SPI (SCLK=6, MOSI=7, DC=2, CS=10), 80 MHz 写入.
 - 触控: CST816D at I2C 0x15 (INT=GPIO0, SDA=4, SCL=5).
@@ -12,35 +12,46 @@
 - 后端运行于 `http://192.168.0.35:8765`.
 - 最近一次 STA 地址: `192.168.0.26`（由 DHCP 分配，不应写死）.
 - 分区方案: `huge_app`（关闭 OTA，给应用 ~3 MB 空间）.
-- 编译结果: 1,599,928 bytes Flash (50%), 42,852 bytes global RAM (13%).
+- 编译结果: 1,609,810 bytes Flash (51%), 43,132 bytes global RAM (13%).
 - UI 仅使用 LovyanGFX 直接渲染，不再依赖或初始化 LVGL.
 - 仓库工作内容约 7.9 MB（不含 `.git` 和本地 `.venv`）.
 
-2026-07-24 最后验证时，后端健康检查正常；面板完成首页、点位滑动、选点和返回流程后，通过“配置网络”按钮进入 AP 配网模式。需要恢复 STA 时重新提交 Wi-Fi 和后端地址。
+2026-07-24 最后验证时，后端运行于 `8765`，面板已通过 NVS 配置重新连接并持续成功读取机器人状态。HTTP 送货、巡检、任务覆盖和实体首页状态联动均已验证。
 
 ## 用户操作流程
 
-1. 启动 → Wi-Fi 连接（或 AP 配网）→ 后台获取点位配置.
-2. 首页点击“选择点位” → 进入可上下滑动的点位列表.
-3. 点击某一点位 → 确认呼叫页面.
-4. 确认 → 发送导航请求 → 轮询 `navigating` → `arrived`.
-5. 到达后 → 选择“常规巡检” → 轮询 `running` → `completed`.
-6. 完成巡检 → 回到首页.
-7. 点击“配置网络”，或长按首页顶部 64 px 区域 5 秒 → 进入配网模式.
+1. 启动 → Wi-Fi 连接（或 AP 配网）→ 加载点位和全局机器狗状态.
+2. 首页显示空闲/任务中、当前位置、目标点，并提供“送货”“巡检”“配置网络”.
+3. 送货：选择召唤点 → 到达 → 确认装货 → 选择不同的送货点 → 到达 → 确认卸货或等待 120 秒自动完成.
+4. 巡检：选择巡检点 → 到达 → 选择巡检类型 → 执行完成.
+5. 机器狗忙碌时，新建送货或巡检需二次确认；最终提交时原子取消旧任务并创建新任务.
+6. 点击首页忙碌状态区，可恢复当前任务对应页面.
+7. 配网仅保留首页可见按钮，不再支持顶部区域长按.
 
 ## 后端 API
 
 | Endpoint | 用途 |
 | --- | --- |
 | `GET /health` | 健康检查 |
+| `GET /api/robot/status` | 获取全局空闲/忙碌、位置、目标和活动任务 |
 | `GET /api/panels/{device_id}/config` | 获取点位配置 |
 | `GET /api/points/{point_id}/inspections` | 获取可选巡检项 |
-| `POST /api/navigation-tasks` | 创建导航任务 |
+| `POST /api/navigation-tasks` | 创建召唤或巡检导航，可通过 `replace_task_id` 原子覆盖 |
+| `POST /api/navigation-tasks/{id}/load-complete` | 确认装货并进入送货点选择 |
+| `POST /api/delivery-tasks` | 从召唤任务创建送货任务 |
+| `POST /api/delivery-tasks/{id}/unload-complete` | 人工确认卸货完成 |
 | `POST /api/inspection-tasks` | 创建巡检任务 |
 | `GET /api/tasks/{task_id}` | 轮询任务状态 |
 
 后端支持 `X-API-Token` Header 鉴权（通过环境变量 `ROBOT_PANEL_API_TOKEN` 设置）。
-模拟器通过 `RobotAdapter` 异步模拟机器人行为：导航 `queued→navigating→arrived`（~4s），巡检 `queued→running→completed`（~4s）。
+模拟器通过 `RobotAdapter` 异步模拟机器人行为：
+
+- 送货召唤：`queued → navigating → awaiting_load → awaiting_destination`.
+- 送货：`queued → delivering → awaiting_unload → completed`.
+- 巡检导航：`queued → navigating → arrived`，随后巡检 `queued → running → completed`.
+- 被新任务覆盖：活动任务进入 `cancelled`，对应异步协程同时取消，不能继续更新位置.
+
+机器狗首次启动为空闲并位于“大厅”。移动过程中保留最后已知位置，同时单独返回目标点；到达时更新当前位置。卸货默认等待 120 秒，可用 `DELIVERY_UNLOAD_TIMEOUT_SECONDS` 调整。
 `event_id` 幂等：相同 event_id 重复请求返回已有任务。
 任务和幂等映射当前只保存在进程内存中，后端重启后会清空。
 
@@ -50,7 +61,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `robot_inspection_panel.ino` | 主程序：setup/loop、触摸分发、UI 渲染、业务状态机 |
+| `robot_inspection_panel.ino` | 主程序：全局状态轮询、送货/巡检状态机、触摸分发和 UI 渲染 |
 | `ProvisioningPortal.h` | Wi-Fi 配网类声明 |
 | `ProvisioningPortal.cpp` | 配网状态机：扫描、连接、AP、WebServer、DNS、NVS 持久化 |
 | `CST816D.cpp` / `.h` | 触控控制器驱动 |
@@ -145,11 +156,15 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 
 | 页面 | 内容 |
 | --- | --- |
-| HOME | 站点名、Wi-Fi 状态、“选择点位”和“配置网络”入口 |
-| POINT\_LIST | 可上下滑动的点位按钮列表 |
+| HOME | 站点名、机器狗状态与位置、“送货”“巡检”“配置网络”入口 |
+| OVERRIDE\_CONFIRM | 展示当前任务并二次确认是否覆盖 |
+| POINT\_LIST | 复用的召唤点、巡检点或送货点滚动列表 |
 | NETWORK\_SETUP | "网络配置"标题、QR 码/热点名/IP 或验证状态或失败提示 |
-| CONFIRM\_CALL | "确认呼叫"、点位名、取消/确认按钮 |
-| WAIT\_ARRIVAL | 任务状态（"发送中"→"前往点位"→"已到达"） |
+| CONFIRM\_NAVIGATION | 确认召唤或巡检导航，覆盖任务时显示警告 |
+| WAIT\_ARRIVAL | 等待机器狗到达召唤点或巡检点 |
+| DELIVERY\_LOAD | 到达召唤点后确认装货 |
+| DELIVERY\_CONFIRM | 确认取货点和送货点 |
+| DELIVERY\_STATUS | 送货、等待卸货和倒计时状态 |
 | PICK\_INSPECTION | "选择巡检类型"、可选列表 |
 | INSPECTION\_STATUS | "巡检中"→"已完成"、"失败" |
 | ERROR\_PAGE | 错误信息 |
@@ -161,7 +176,8 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 - 点位列表在松手时才区分点击与滑动：移动至少 8 px 视为拖动，否则视为选点。
 - CST816D 短暂掉触使用 40 ms 容错；控制器只返回手势时，上/下滑会按 114 px 步进滚动。
 - 打开点位页的那次按压必须先松手，不能被复用为列表点击。
-- 首页顶部 64px 区域检测长按 5 秒进入配网。
+- 首页状态区在机器狗忙碌时可点击，用于恢复活动任务页面。
+- 首页三个按钮位于 y=90、132、174；状态未知超过 3 秒时送货和巡检显示禁用样式并拒绝进入。
 - 后台每 250ms 输出诊断日志。
 
 ### 串口诊断（115200 baud）
@@ -183,6 +199,8 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 - `RobotAdapter` 是睡眠等待模拟。接入真实机器人时需要保留面板侧 API 和 `event_id` 幂等性。
 - 新增页面内容时需继续通过 `circularSafeWidth()` 校验圆屏边界。
 - 点位和巡检项分别最多加载 20 和 4 条，超出部分会被截断。
+- 当前为单机器狗、全局单活动任务模型，不包含多机器人选择和持久化任务队列。
+- 模拟后端重启后任务清空，机器狗位置重置为大厅。
 - Git 历史仍包含已删除的厂商大文件和旧 Wi-Fi 凭据；凭据需要轮换，历史瘦身需单独实施。
 
 ## 编译与烧录
@@ -215,15 +233,24 @@ uvicorn app:app --host 0.0.0.0 --port 8765
 
 Swagger 文档：`http://192.168.0.35:8765/docs`。后端地址变化时同步更新 `config.h` 中的 `BACKEND_URL`。
 
+后端测试：
+
+```bash
+cd backend
+.venv/bin/python -m unittest -v test_app.py
+```
+
 ## 下一步功能
 
 1. **后端状态页面** — 查看当前 NVS 配置、设备 ID、固件版本
 2. **无线 OTA** — 需要调整当前 `huge_app` 分区方案
 3. **真实机器人 HTTP 适配器** — 替换 `RobotAdapter` 模拟器
 4. **多语言支持** — 后端巡检点位提供语言字段
+5. **任务持久化** — 将当前内存任务和机器人位置迁移到数据库或真实机器人状态源
 
 ## 最近完成
 
+- v1.1: 新增全局机器狗状态、送货流程、任务恢复、二次确认覆盖和 120 秒卸货超时。
 - `7a92a0e`: 点位列表点击/拖动分离，支持滑动选择更多点位。
 - `33ab10c`: 移除未使用的 LVGL、旧页面构建器、双缓冲和 DMA 初始化。
 - `091071c`: 精简厂商资源、停止跟踪敏感配置和 Python 缓存，统一文档端口为 `8765`。
