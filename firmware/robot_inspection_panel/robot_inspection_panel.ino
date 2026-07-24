@@ -18,6 +18,10 @@ static constexpr uint8_t DRAW_ROWS = 24;
 static constexpr uint8_t MAX_POINTS = 20;
 static constexpr uint8_t MAX_INSPECTIONS = 4;
 static constexpr unsigned long POLL_INTERVAL_MS = 1000;
+static constexpr int16_t POINT_VIEW_X = 32;
+static constexpr int16_t POINT_VIEW_Y = 70;
+static constexpr int16_t POINT_VIEW_W = 176;
+static constexpr int16_t POINT_VIEW_H = 170;
 
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_GC9A01 panel_;
@@ -47,6 +51,7 @@ enum Page { HOME, POINT_LIST, CONFIRM_CALL, WAIT_ARRIVAL, PICK_INSPECTION, INSPE
 enum PendingAction { NO_ACTION, LOAD_POINTS, LOAD_INSPECTIONS, SEND_NAVIGATION, SEND_INSPECTION };
 
 LGFX tft;
+LGFX_Sprite point_list_canvas(&tft);
 CST816D touch(4, 5, 1, 0);
 ProvisioningPortal provisioning;
 static lv_color_t draw_a[SCREEN_W * DRAW_ROWS];
@@ -73,7 +78,12 @@ static unsigned long pending_action_since = 0;
 static int16_t point_scroll = 0;  // scroll offset for POINT_LIST
 static int16_t point_scroll_anchor = 0;
 static bool point_scroll_dragging = false;
+static bool point_scroll_moved = false;
+static bool point_wait_for_release = false;
 static uint16_t point_scroll_start_y = 0;
+static uint8_t point_scroll_gesture = 0;
+static unsigned long point_release_since = 0;
+static bool point_list_canvas_ready = false;
 
 #define LOGI(format, ...) do { \
   if (Serial && Serial.availableForWrite() >= 128) { \
@@ -88,6 +98,7 @@ static bool createNavigation();
 static bool createInspection();
 static void handleRawTap(uint16_t x, uint16_t y);
 static void renderDirectPage();
+static void renderPointListViewport();
 static void scheduleAction(PendingAction action);
 
 static String endpoint(const char *path) { return provisioning.backendUrl() + path; }
@@ -250,6 +261,8 @@ static void handleRawTap(uint16_t x, uint16_t y) {
         showPage(ERROR_PAGE);
       } else {
         point_scroll = 0;
+        // Do not reuse the press that opened this page as a list gesture.
+        point_wait_for_release = true;
         page = POINT_LIST;
         renderDirectPage();
       }
@@ -342,6 +355,40 @@ static void directButton(const String &text, int top) {
   directText(text, top + 17, 1, TFT_WHITE);
 }
 
+static int pointMaxScroll() {
+  return max(0, (int)point_count * 38 - (230 - 78));
+}
+
+static void renderPointListViewport() {
+  if (!point_list_canvas_ready) return;
+
+  point_scroll = constrain(point_scroll, 0, pointMaxScroll());
+  point_list_canvas.fillScreen(0);
+  point_list_canvas.setFont(&fonts::efontCN_16);
+  point_list_canvas.setTextSize(1);
+  point_list_canvas.setTextDatum(lgfx::middle_center);
+  point_list_canvas.setTextColor(3);
+
+  for (uint8_t i = 0; i < point_count; ++i) {
+    int top = 78 + i * 38 - point_scroll - POINT_VIEW_Y;
+    if (top >= POINT_VIEW_H || top + 34 <= 0) continue;
+
+    point_list_canvas.fillRoundRect(8, top, 160, 34, 5, 1);
+    point_list_canvas.drawRoundRect(8, top, 160, 34, 5, 2);
+    String visible = points[i].name;
+    bool truncated = point_list_canvas.textWidth(visible) > 148;
+    while (visible.length() > 3 && point_list_canvas.textWidth(visible + "...") > 148) {
+      removeLastUtf8Character(visible);
+    }
+    if (truncated) visible += "...";
+    point_list_canvas.drawString(visible, POINT_VIEW_W / 2, top + 17);
+  }
+
+  // The complete viewport is transferred in one SPI operation, so the cleared
+  // background is never visible as an intermediate frame.
+  point_list_canvas.pushSprite(POINT_VIEW_X, POINT_VIEW_Y);
+}
+
 static void renderProvisioningQr(esp_qrcode_handle_t qr) {
   const int qrSize = esp_qrcode_get_size(qr);
   const int scale = 3;
@@ -408,17 +455,13 @@ static void renderDirectPage() {
   } else if (page == POINT_LIST) {
     directText("选择巡检点位", 30, 1, TFT_CYAN);
     directText("上下滑动查看更多", 56, 0, TFT_DARKGREY);
-    int btn_top = 78;
-    // visible area: y 78-230, each button 34px tall, 4px gap = 38px stride
-    // scroll_limit: max(0, point_count * 38 - (230 - 78))
-    int max_scroll = point_count * 38 - (230 - 78);
-    if (max_scroll < 0) max_scroll = 0;
-    if (point_scroll > max_scroll) point_scroll = max_scroll;
-    if (point_scroll < 0) point_scroll = 0;
-    for (uint8_t i = 0; i < point_count; ++i) {
-      int y_pos = btn_top + i * 38 - point_scroll;
-      if (y_pos >= 72 && y_pos <= 234) {
-        directButton(points[i].name, y_pos);
+    if (point_list_canvas_ready) {
+      renderPointListViewport();
+    } else {
+      point_scroll = constrain(point_scroll, 0, pointMaxScroll());
+      for (uint8_t i = 0; i < point_count; ++i) {
+        int y_pos = 78 + i * 38 - point_scroll;
+        if (y_pos >= 72 && y_pos <= 234) directButton(points[i].name, y_pos);
       }
     }
   } else if (page == CONFIRM_CALL) {
@@ -547,6 +590,15 @@ void setup() {
   tft.init();
   tft.initDMA();
   tft.fillScreen(TFT_BLACK);
+  point_list_canvas.setColorDepth(lgfx::palette_2bit);
+  point_list_canvas_ready = point_list_canvas.createSprite(POINT_VIEW_W, POINT_VIEW_H) != nullptr;
+  if (point_list_canvas_ready) {
+    point_list_canvas.setPaletteColor(0, 0x000000U);
+    point_list_canvas.setPaletteColor(1, 0x555555U);
+    point_list_canvas.setPaletteColor(2, 0x00FFFFU);
+    point_list_canvas.setPaletteColor(3, 0xFFFFFFU);
+  }
+  LOGI("Point list canvas: %s (%dx%d, 2-bit)", point_list_canvas_ready ? "ready" : "allocation failed", POINT_VIEW_W, POINT_VIEW_H);
   // Keep the GC9A01 SPI transaction open, matching the vendor LVGL example.
   // Re-opening it for the first direct frame can block for several seconds.
   tft.startWrite();
@@ -578,36 +630,74 @@ void loop() {
   uint16_t raw_x = 0, raw_y = 0;
   uint8_t raw_gesture = 0;
   bool raw_touched = touch.getTouch(&raw_x, &raw_y, &raw_gesture);
+  Page page_at_touch_start = page;
   if (raw_touched && !raw_touch_pressed && millis() - last_raw_tap_ms >= 350) {
-    last_raw_tap_ms = millis();
-    handleRawTap(raw_x, raw_y);
+    // List taps are resolved on release so a drag cannot select its first row.
+    if (page_at_touch_start != POINT_LIST) {
+      last_raw_tap_ms = millis();
+      handleRawTap(raw_x, raw_y);
+    }
   }
   raw_touch_pressed = raw_touched;
-  // Point list scrolling: track drag and re-render each frame
+  // Point list scrolling: distinguish a tap from a drag, then resolve on release.
   if (page == POINT_LIST) {
-    if (raw_touched) {
+    if (point_wait_for_release) {
+      if (!raw_touched) point_wait_for_release = false;
+      point_scroll_dragging = false;
+      point_release_since = 0;
+    } else if (raw_touched) {
+      point_release_since = 0;
       if (!point_scroll_dragging) {
         point_scroll_dragging = true;
+        point_scroll_moved = false;
         point_scroll_anchor = point_scroll;
         point_scroll_start_y = raw_y;
+        point_scroll_gesture = raw_gesture;
       } else {
+        if (raw_gesture) point_scroll_gesture = raw_gesture;
         int16_t delta = (int16_t)point_scroll_start_y - (int16_t)raw_y;
-        int16_t new_scroll = point_scroll_anchor + delta;
-        int max_scroll = (int16_t)point_count * 38 - (230 - 78);
-        if (max_scroll < 0) max_scroll = 0;
-        if (new_scroll < 0) new_scroll = 0;
-        if (new_scroll > max_scroll) new_scroll = max_scroll;
-        if (new_scroll != point_scroll) {
-          point_scroll = new_scroll;
-          renderDirectPage();
+        if (abs(delta) >= 8) {
+          point_scroll_moved = true;
+          int16_t new_scroll = point_scroll_anchor + delta;
+          int max_scroll = (int16_t)point_count * 38 - (230 - 78);
+          if (max_scroll < 0) max_scroll = 0;
+          if (new_scroll < 0) new_scroll = 0;
+          if (new_scroll > max_scroll) new_scroll = max_scroll;
+          if (new_scroll != point_scroll) {
+            point_scroll = new_scroll;
+            if (point_list_canvas_ready) renderPointListViewport();
+            else renderDirectPage();
+          }
         }
       }
-    } else {
-      if (point_scroll_dragging) {
+    } else if (point_scroll_dragging) {
+      // CST816D can briefly report release while a finger is still down.
+      if (!point_release_since) {
+        point_release_since = millis();
+      } else if (millis() - point_release_since >= 40) {
+        if (!point_scroll_moved && (point_scroll_gesture == 1 || point_scroll_gesture == 2)) {
+          int max_scroll = (int16_t)point_count * 38 - (230 - 78);
+          if (max_scroll < 0) max_scroll = 0;
+          point_scroll += point_scroll_gesture == 1 ? 114 : -114;
+          if (point_scroll < 0) point_scroll = 0;
+          if (point_scroll > max_scroll) point_scroll = max_scroll;
+          point_scroll_moved = true;
+        }
+        bool was_tap = !point_scroll_moved;
+        uint16_t tap_y = point_scroll_start_y;
         point_scroll_dragging = false;
-        renderDirectPage();
+        point_release_since = 0;
+        if (point_list_canvas_ready) renderPointListViewport();
+        else renderDirectPage();
+        if (was_tap && millis() - last_raw_tap_ms >= 350) {
+          last_raw_tap_ms = millis();
+          handleRawTap(0, tap_y);
+        }
       }
     }
+  } else {
+    point_scroll_dragging = false;
+    point_release_since = 0;
   }
   if (page == HOME && raw_touched && raw_y <= 64 && !provisioning.isPortal()) {
     if (!title_hold_since) title_hold_since = millis();
