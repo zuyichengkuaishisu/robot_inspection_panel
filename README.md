@@ -16,20 +16,20 @@ Set `ROBOT_PANEL_API_TOKEN` only when a panel token is also configured in `firmw
 
 ## Wi-Fi Provisioning
 
-The panel first scans for nearby networks, then tries the saved Wi-Fi configuration for 15 seconds. If no usable configuration exists or the connection fails, it starts an open hotspot named `SmartInspect-XXXX`, where `XXXX` is derived from the device MAC address.
+The panel scans for nearby 2.4 GHz Wi-Fi networks for 8 seconds on boot. If a previously saved configuration exists in NVS, it attempts to connect directly. Otherwise, or if the saved network is unreachable, it starts an open AP hotspot named `SmartInspect-XXXX` (where `XXXX` is the last four hex digits of the device MAC).
 
-Connect a phone to that hotspot and open `http://192.168.4.1/`. The panel also displays a QR code for joining the hotspot. The page can scan nearby Wi-Fi networks, configure a hidden SSID manually, and set the backend HTTP URL. Credentials are tested before they are written to NVS; a failed test leaves the portal available for another attempt.
+Connect a phone to the hotspot. The panel displays a QR code for easy joining, and the captive portal automatically opens `http://192.168.4.1/`. The web page lists all scanned networks with signal strength, allows manual SSID entry, and collects the Wi-Fi password (leave blank for an open network) and the backend HTTP URL.
 
-When the panel is already online, hold the `智巡精灵 v1.0` title for five seconds to enter provisioning mode again. Existing `config.h` values are used as a migration fallback until a web configuration is saved.
+After submitting, the panel switches to STA mode, connects to the target network, and checks the backend `/health` endpoint. On success the configuration is saved to NVS and the panel restarts; on failure the AP portal remains open for another attempt. A backend warning does not prevent saving the Wi-Fi configuration.
 
-Once provisioning mode starts, that state is stored in NVS. Resetting the panel keeps the hotspot and portal active until a new Wi-Fi configuration has been verified and saved successfully.
+The panel operates in **pure AP-only mode** during provisioning — no mixed STA/AP mode. After a successful provision it restarts and connects as a Wi-Fi station. To reprovision from an already-connected state, hold the title bar for five seconds on the home page.
 
 ## Firmware
 
-Edit `firmware/robot_inspection_panel/config.h`, especially `BACKEND_URL` (use the LAN IP of the backend host), then compile:
+Edit `firmware/robot_inspection_panel/config.h`, especially `BACKEND_URL` (use the LAN IP of the backend host). The `WIFI_SSID` / `WIFI_PASSWORD` values in config.h are only used as a first-boot fallback; after the first web provisioning, credentials are stored in NVS.
 
 ```bash
 arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=huge_app firmware/robot_inspection_panel
 ```
 
-Required Arduino libraries are LovyanGFX, LVGL 9 and ArduinoJson. `huge_app` is required because the UI and Wi-Fi HTTP client exceed the default 1.2 MB application partition; it disables OTA updates. The panel flow is point selection, call confirmation, arrival polling, inspection selection, then inspection polling.
+Required Arduino libraries are LovyanGFX, LVGL 9, ArduinoJson and QRCode. `huge_app` is required because the UI and Wi-Fi HTTP client exceed the default 1.2 MB application partition; it disables OTA updates. The panel flow is point selection, call confirmation, arrival polling, inspection selection, then inspection polling.

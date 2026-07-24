@@ -15,7 +15,7 @@
 static constexpr uint16_t SCREEN_W = 240;
 static constexpr uint16_t SCREEN_H = 240;
 static constexpr uint8_t DRAW_ROWS = 24;
-static constexpr uint8_t MAX_POINTS = 6;
+static constexpr uint8_t MAX_POINTS = 20;
 static constexpr uint8_t MAX_INSPECTIONS = 4;
 static constexpr unsigned long POLL_INTERVAL_MS = 1000;
 
@@ -43,7 +43,7 @@ class LGFX : public lgfx::LGFX_Device {
 };
 
 struct Option { char id[32]; char name[48]; };
-enum Page { HOME, CONFIRM_CALL, WAIT_ARRIVAL, PICK_INSPECTION, INSPECTION_STATUS, ERROR_PAGE, NETWORK_SETUP };
+enum Page { HOME, POINT_LIST, CONFIRM_CALL, WAIT_ARRIVAL, PICK_INSPECTION, INSPECTION_STATUS, ERROR_PAGE, NETWORK_SETUP };
 enum PendingAction { NO_ACTION, LOAD_POINTS, LOAD_INSPECTIONS, SEND_NAVIGATION, SEND_INSPECTION };
 
 LGFX tft;
@@ -70,6 +70,10 @@ static unsigned long title_hold_since = 0;
 static bool title_hold_triggered = false;
 static PendingAction pending_action = NO_ACTION;
 static unsigned long pending_action_since = 0;
+static int16_t point_scroll = 0;  // scroll offset for POINT_LIST
+static int16_t point_scroll_anchor = 0;
+static bool point_scroll_dragging = false;
+static uint16_t point_scroll_start_y = 0;
 
 #define LOGI(format, ...) do { \
   if (Serial && Serial.availableForWrite() >= 128) { \
@@ -91,6 +95,7 @@ static String endpoint(const char *path) { return provisioning.backendUrl() + pa
 static const char *pageName(Page value) {
   switch (value) {
     case HOME: return "HOME";
+    case POINT_LIST: return "POINT_LIST";
     case CONFIRM_CALL: return "CONFIRM_CALL";
     case WAIT_ARRIVAL: return "WAIT_ARRIVAL";
     case PICK_INSPECTION: return "PICK_INSPECTION";
@@ -235,16 +240,39 @@ static void selectInspection(lv_event_t *e) {
 static void handleRawTap(uint16_t x, uint16_t y) {
   LOGI("Raw tap x=%u y=%u page=%s", x, y, pageName(page));
   if (page == HOME) {
-    if (!provisioning.isNormal() && y >= 168) {
+    // "选择点位" button
+    if (y >= 110 && y < 144) {
+      if (!provisioning.isConnected() || WiFi.status() != WL_CONNECTED) {
+        error_message = "请先连接网络";
+        showPage(ERROR_PAGE);
+      } else if (point_count == 0) {
+        error_message = "点位列表为空";
+        showPage(ERROR_PAGE);
+      } else {
+        point_scroll = 0;
+        page = POINT_LIST;
+        renderDirectPage();
+      }
+      return;
+    }
+    // "配置网络" button
+    if (y >= 165 && y < 199) {
       provisioning.startPortal();
       page = NETWORK_SETUP;
       renderDirectPage();
-      provisioning.clearRenderRequest();
       return;
     }
-    for (uint8_t i = 0; i < point_count; ++i) {
-      int top = 86 + i * 36;
-      if (y >= top && y < top + 34) { selected_point = i; showPage(CONFIRM_CALL); return; }
+  } else if (page == POINT_LIST) {
+    // Tap on a point button (scrolling handled by drag in loop())
+    if (y >= 78 && y <= 230) {
+      for (uint8_t i = 0; i < point_count; ++i) {
+        int btn_y = 78 + i * 38 - point_scroll;
+        if (y >= btn_y && y < btn_y + 34) {
+          selected_point = i;
+          showPage(CONFIRM_CALL);
+          return;
+        }
+      }
     }
   } else if (page == CONFIRM_CALL) {
     if (y >= 140 && y < 174) { confirmCall(nullptr); return; }
@@ -344,36 +372,54 @@ static void renderDirectPage() {
   if (page == NETWORK_SETUP) {
     ProvisioningState state = provisioning.state();
     directText("网络配置", 31, 1, TFT_CYAN);
-    if (state == PROVISION_AP) {
+    if (state == PROVISION_AP || state == PROVISION_FAILED) {
       drawProvisioningQr();
       directText(provisioning.apSsid(), 180, 1, TFT_WHITE);
       directText("扫码加入热点", 198, 1, TFT_WHITE);
       directText("192.168.4.1", 216, 1, TFT_CYAN);
+      if (state == PROVISION_FAILED) {
+        directText(provisioning.message(), 100, 1, TFT_RED);
+      }
     } else if (state == PROVISION_VERIFYING) {
-      directText("正在验证 Wi-Fi", 86, 1, TFT_YELLOW);
+      directText("正在连接 Wi-Fi", 86, 1, TFT_YELLOW);
       directText(provisioning.candidateSsid(), 115, 1, TFT_WHITE);
       directText("请保持手机连接热点", 145, 1, TFT_WHITE);
       directText("192.168.4.1", 190, 1, TFT_CYAN);
-    } else if (state == PROVISION_SUCCESS) {
+    } else if (state == PROVISION_CONNECTING) {
       directText("配置成功", 100, 1, TFT_GREEN);
-      directText(provisioning.message(), 135, 1, TFT_WHITE);
-    } else {
-      directText("连接失败", 88, 1, TFT_RED);
-      directText(provisioning.message(), 120, 1, TFT_WHITE);
-      directText("192.168.4.1", 170, 1, TFT_CYAN);
-      directText("请返回网页重试", 200, 1, TFT_WHITE);
+      directText(provisioning.message(), 140, 1, TFT_WHITE);
+      directText("即将重启...", 170, 1, TFT_YELLOW);
     }
   } else if (page == HOME) {
-    directText("智巡精灵 v1.0", 36, 1, TFT_CYAN);
-    directText(WiFi.status() == WL_CONNECTED ? "Wi-Fi 已连接" : "Wi-Fi 连接中...", 58);
-    if (WiFi.status() != WL_CONNECTED) {
-      directText(provisioning.message(), 112);
-      directButton("配置网络", 170);
+    // 第1行: 设备名称
+    directText(PANEL_SITE_NAME, 34, 1, TFT_CYAN);
+    // 第2行: Wi-Fi 状态
+    if (WiFi.status() == WL_CONNECTED) {
+      String status = provisioning.activeSsid() + "  " + WiFi.localIP().toString();
+      directText(status, 60, 0, TFT_GREEN);
+    } else if (provisioning.isPortal() || provisioning.state() == PROVISION_SCANNING) {
+      directText("Wi-Fi 未连接", 60, 1, TFT_RED);
+    } else {
+      directText("Wi-Fi 连接中...", 60, 1, TFT_YELLOW);
     }
-    else if (point_count == 0) directText("正在加载点位...", 112);
-    else {
-      directText("请选择巡检点位", 76);
-      for (uint8_t i = 0; i < point_count; ++i) directButton(points[i].name, 86 + i * 36);
+    // 中间: 两个功能入口按钮
+    directButton("选择点位", 110);
+    directButton("配置网络", 165);
+  } else if (page == POINT_LIST) {
+    directText("选择巡检点位", 30, 1, TFT_CYAN);
+    directText("上下滑动查看更多", 56, 0, TFT_DARKGREY);
+    int btn_top = 78;
+    // visible area: y 78-230, each button 34px tall, 4px gap = 38px stride
+    // scroll_limit: max(0, point_count * 38 - (230 - 78))
+    int max_scroll = point_count * 38 - (230 - 78);
+    if (max_scroll < 0) max_scroll = 0;
+    if (point_scroll > max_scroll) point_scroll = max_scroll;
+    if (point_scroll < 0) point_scroll = 0;
+    for (uint8_t i = 0; i < point_count; ++i) {
+      int y_pos = btn_top + i * 38 - point_scroll;
+      if (y_pos >= 72 && y_pos <= 234) {
+        directButton(points[i].name, y_pos);
+      }
     }
   } else if (page == CONFIRM_CALL) {
     directText("确认呼叫", 42, 1, TFT_YELLOW);
@@ -387,7 +433,7 @@ static void renderDirectPage() {
     directText(points[selected_point].name, 70);
     directText(localizedStatus(task_status), 108, 1, TFT_YELLOW);
     directText(task_message, 136);
-    directButton("取消 / 返回", 180);
+    directButton("返回", 180);
   } else if (page == PICK_INSPECTION) {
     directText("机器人已到达", 42, 1, TFT_GREEN);
     if (inspection_count == 0) directText("正在加载巡检项目...", 112);
@@ -469,7 +515,7 @@ static void showPage(Page next) {
   page = next;
   last_poll = millis();
   renderDirectPage();
-  if (page == HOME && provisioning.isNormal() && WiFi.status() == WL_CONNECTED && point_count == 0) scheduleAction(LOAD_POINTS);
+  if (page == HOME && provisioning.isConnected() && WiFi.status() == WL_CONNECTED && point_count == 0) scheduleAction(LOAD_POINTS);
   if (page == PICK_INSPECTION && inspection_count == 0) scheduleAction(LOAD_INSPECTIONS);
 }
 
@@ -484,7 +530,7 @@ static void runPendingAction() {
   pending_action = NO_ACTION;
   bool ok = false;
 
-  if (action == LOAD_POINTS && page == HOME) ok = fetchPoints();
+  if (action == LOAD_POINTS && (page == HOME || page == POINT_LIST)) ok = fetchPoints();
   else if (action == LOAD_INSPECTIONS && page == PICK_INSPECTION) ok = fetchInspections();
   else if (action == SEND_NAVIGATION && page == WAIT_ARRIVAL) ok = createNavigation();
   else if (action == SEND_INSPECTION && page == INSPECTION_STATUS) ok = createInspection();
@@ -522,7 +568,7 @@ void setup() {
   lv_indev_set_display(touch_input, display);
   lv_indev_set_read_cb(touch_input, [](lv_indev_t *, lv_indev_data_t *data) { static bool was_pressed = false; uint16_t x, y; uint8_t gesture; ++touch_input_reads; if (touch.getTouch(&x, &y, &gesture)) { data->state = LV_INDEV_STATE_PRESSED; data->point.x = x; data->point.y = y; if (!was_pressed) LOGI("LVGL touch x=%u y=%u gesture=%u", x, y, gesture); was_pressed = true; } else { data->state = LV_INDEV_STATE_RELEASED; was_pressed = false; } });
   screen = lv_obj_create(nullptr); lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE); lv_obj_set_style_pad_all(screen, 8, 0); lv_screen_load(screen);
-  provisioning.begin(WIFI_SSID, WIFI_PASSWORD, BACKEND_URL, PANEL_DEVICE_ID);
+  provisioning.begin(BACKEND_URL, PANEL_DEVICE_ID);
   showPage(HOME);
   digitalWrite(3, HIGH);
   LOGI("Wi-Fi provisioning state started");
@@ -537,7 +583,33 @@ void loop() {
     handleRawTap(raw_x, raw_y);
   }
   raw_touch_pressed = raw_touched;
-  if (page == HOME && provisioning.isNormal() && raw_touched && raw_y <= 64) {
+  // Point list scrolling: track drag and re-render each frame
+  if (page == POINT_LIST) {
+    if (raw_touched) {
+      if (!point_scroll_dragging) {
+        point_scroll_dragging = true;
+        point_scroll_anchor = point_scroll;
+        point_scroll_start_y = raw_y;
+      } else {
+        int16_t delta = (int16_t)point_scroll_start_y - (int16_t)raw_y;
+        int16_t new_scroll = point_scroll_anchor + delta;
+        int max_scroll = (int16_t)point_count * 38 - (230 - 78);
+        if (max_scroll < 0) max_scroll = 0;
+        if (new_scroll < 0) new_scroll = 0;
+        if (new_scroll > max_scroll) new_scroll = max_scroll;
+        if (new_scroll != point_scroll) {
+          point_scroll = new_scroll;
+          renderDirectPage();
+        }
+      }
+    } else {
+      if (point_scroll_dragging) {
+        point_scroll_dragging = false;
+        renderDirectPage();
+      }
+    }
+  }
+  if (page == HOME && raw_touched && raw_y <= 64 && !provisioning.isPortal()) {
     if (!title_hold_since) title_hold_since = millis();
     if (!title_hold_triggered && millis() - title_hold_since >= 5000) {
       title_hold_triggered = true;
@@ -555,10 +627,10 @@ void loop() {
     else if (page == NETWORK_SETUP) { page = HOME; point_count = 0; }
     renderDirectPage();
     provisioning.clearRenderRequest();
-    if (page == HOME && provisioning.isNormal() && point_count == 0) scheduleAction(LOAD_POINTS);
+    if (provisioning.isConnected() && point_count == 0 && WiFi.status() == WL_CONNECTED) scheduleAction(LOAD_POINTS);
   }
   if (pending_action != NO_ACTION && millis() - pending_action_since >= 50) runPendingAction();
-  if (page == HOME && provisioning.isNormal() && point_count == 0 && WiFi.status() == WL_CONNECTED && millis() - last_home_refresh >= 1000) {
+  if (page == HOME && provisioning.isConnected() && point_count == 0 && WiFi.status() == WL_CONNECTED && millis() - last_home_refresh >= 1000) {
     last_home_refresh = millis();
     LOGI("Wi-Fi connected IP=%s RSSI=%d", WiFi.localIP().toString().c_str(), WiFi.RSSI());
     showPage(HOME);

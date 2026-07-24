@@ -55,25 +55,31 @@
 状态流转：
 
 ```
-PROVISION_SCANNING (扫描 Wi-Fi)
-  ├─ 有已保存凭据 → PROVISION_CONNECTING → 成功 → PROVISION_NORMAL
-  │                                       → 15秒超时 → PROVISION_AP
-  └─ 无凭据 → PROVISION_AP
-      
-PROVISION_AP (开放热点 SmartInspect-XXXX)
-  ├─ 网页提交配置 → PROVISION_VERIFYING
-  │   ├─ 连接成功 + 后端可达 → 写入 NVS → PROVISION_SUCCESS → 2秒后重启
-  │   └─ 失败 → PROVISION_FAILED (可重新提交)
-  └─ [保持热点直到验证成功]
+启动
+ ├─ NVS 有已保存凭据 → PROVISION_SCANNING → WiFi.begin()
+ │   ├─ 12秒内连接成功 → PROVISION_CONNECTING → 正常巡检
+ │   └─ 超时 → 扫描 8s → PROVISION_AP
+ └─ NVS 无凭据 → 扫描 8s → PROVISION_AP (纯 AP 模式)
+     
+PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
+ ├─ 网页提交配置 → PROVISION_VERIFYING
+ │   ├─ 连接目标 Wi-Fi + 后端可达 → 写入 NVS → PROVISION_CONNECTING → 2.2秒后重启
+ │   ├─ 连接目标 Wi-Fi + 后端不可达 → 写入 NVS（显示警告）→ PROVISION_CONNECTING → 重启
+ │   └─ 15秒连接超时 → PROVISION_FAILED (热点保持在线，可重新填写)
+ └─ [网页刷新 / 重新扫描]
 ```
 
 关键设计点：
 
-1. **启动优先读取 NVS**（`preferences_` 命名空间 `provisioning`，键 `version/ssid/password/backend/portal`）。没有 NVS 时回退到 `config.h` 编译时常量。`portal=true` 标志使配网模式跨重启持久化，直到成功保存新 Wi-Fi 后才清除。
+1. **纯 AP 模式**：使用 `WIFI_AP` 而非 `WIFI_AP_STA`，消除信道冲突和二次连接问题。验证时临时切到 `WIFI_STA`，验证失败后恢复 `WIFI_AP`。
 
-2. **`startPortal()`** 执行完整的热点初始化：停止旧 DNS/WebServer，断开 STA，设置 `WIFI_AP_STA` 模式，配置 `192.168.4.1/24`，用 MAC 后 4 位生成 AP SSID（如 `SmartInspect-DB24`），启动 DNS 泛解析（捕获所有域名），注册 HTTP 路由，写入 NVS `portal=true`。
+2. **启动流程**：读取 NVS → 有保存凭据则 `WiFi.begin()` 尝试连接（约 12 秒超时）→ 无凭据或失败则扫描 8 秒后启动热点。
 
-3. **`loop()`** 在配网模式下处理 DNS 查询和 WebServer 请求。连接超时 15 秒。验证阶段尝试连接目标 Wi-Fi，同时用 HTTPClient 检查后端 `/health`。
+3. **`startPortal()`**：`WiFi.mode(WIFI_AP)` → 配置 `192.168.4.1/24` → 用 MAC 后 4 位生成 SSID → 启动 DNS 泛解析 + WebServer。此过程完全断开 STA 连接。
+
+4. **验证流程**：网页提交后 → 切换到 `WIFI_STA` → 尝试连接目标 Wi-Fi → 连接成功后 HTTP GET `/health` → 后端可达则写 NVS 重启，不可达也写 NVS（警告）→ 超时则恢复 AP 模式。
+
+5. **"已连接"状态**：连接成功或使用已有凭据连接后进入 `PROVISION_CONNECTING` 状态。巡检业务仅在 `isConnected()` 且 `WiFi.status() == WL_CONNECTED` 时工作。
 
 ### AP 与 Captive Portal
 
@@ -141,28 +147,15 @@ PROVISION_AP (开放热点 SmartInspect-XXXX)
 
 ## 已知问题与待修复
 
-### 1. **配网热点二次连接问题**（当前首要问题）
+### 1. **配网热点二次连接问题** ✅ 已解决
 
-**症状**：第一次烧录后手机连接 `SmartInspect-XXXX` 能打开配网页；**断开后同一手机或其他手机再次连接热点，页面打不开**。手机提示"连通性测试成功"或"网络不稳定"，但浏览器无法加载 `192.168.4.1`。
+**解决方案**：切换为 **纯 AP 模式**（`WIFI_AP`），消除 `WIFI_AP_STA` 混合模式下的信道冲突和 STA 自动重连干扰。
 
-**原因排查方向**：
-
-- `startPortal()` 中 `WiFi.softAPdisconnect(true)` + `WiFi.disconnect(false, false)` 可能未彻底清理 ESP32 Wi-Fi 驱动状态。
-- 手机第二次连接时，AP 的 DHCP 租约可能未及时刷新，手机获得无效 IP 或未收到新租约。
-- `WIFI_AP_STA` 模式下 STA 接口可能尝试重新连接旧 Wi-Fi，导致信道切换破坏 AP 服务。
-- DNS 或 WebServer 在重建时未完全恢复监听。
-- NVS `portal=true` 标志已持久化，但 `begin()` 检测到该标志后调用的 `startPortal()` 在 `WiFi.mode()` 和 `WiFi.softAP()` 序列上可能存在竞态或状态残留。
-
-**尝试过但无效的修复**：
-- 增加 `dns_.stop()` / `server_.stop()` / `WiFi.softAPdisconnect(true)` 清理。
-- 增加 `WiFi.setSleep(false)`。
-
-**建议调试**：
-1. 串口日志观察 `startPortal()` 调用后 `WiFi.softAP()` 返回值。
-2. 手机连接热点后检查获取的 IP（需为 `192.168.4.x`）。
-3. 在手机上手动输入 `http://192.168.4.1/` 看是否可达。
-4. 尝试不调用 `WiFi.disconnect()` 直接 `WiFi.mode(WIFI_AP)`（纯 AP 模式），验证是否 STA + AP 混合模式的信道冲突问题。
-5. 检查 Captive Portal 探测路径（如 `/generate_204`）是否正常返回 302 重定向。
+变更要点：
+- 启动时扫描 8 秒，无已保存配置则自动进入纯 AP 模式
+- 验证凭据时临时切到 `WIFI_STA` 测试连接，失败后恢复 `WIFI_AP`
+- 移除 NVS `portal` 持久化标志，不再跨重启保持配网状态
+- 连接成功后写入 NVS 并重启进入 STA 模式
 
 ### 2. **渲染性能与内容裁切**
 

@@ -55,7 +55,23 @@ class Task:
     updated_at: float
 
 
-POINTS = [Point(id="lobby", name="大厅"), Point(id="warehouse", name="仓库"), Point(id="line-1", name="一号产线")]
+POINTS = [
+    Point(id="lobby", name="大厅"),
+    Point(id="warehouse", name="仓库"),
+    Point(id="line-1", name="一号产线"),
+    Point(id="line-2", name="二号产线"),
+    Point(id="line-3", name="三号产线"),
+    Point(id="storage", name="原料库"),
+    Point(id="finish", name="成品库"),
+    Point(id="office-a", name="A 办公区"),
+    Point(id="office-b", name="B 办公区"),
+    Point(id="cafeteria", name="食堂"),
+    Point(id="guard", name="门卫"),
+    Point(id="parking", name="停车场"),
+    Point(id="boiler", name="锅炉房"),
+    Point(id="sewage", name="污水处理站"),
+    Point(id="lab", name="实验室"),
+]
 INSPECTIONS = [InspectionOption(id="general", name="常规巡检")]
 TASKS: dict[str, Task] = {}
 EVENTS: dict[str, str] = {}

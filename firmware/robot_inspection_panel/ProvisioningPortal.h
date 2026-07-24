@@ -7,7 +7,16 @@
 #include <WebServer.h>
 #include <WiFi.h>
 
-enum ProvisioningState { PROVISION_SCANNING, PROVISION_CONNECTING, PROVISION_NORMAL, PROVISION_AP, PROVISION_VERIFYING, PROVISION_FAILED, PROVISION_SUCCESS };
+// Simplified states for AP-only provisioning flow:
+// SCANNING → AP (auto if no saved config) → VERIFYING → SUCCESS or FAILED
+enum ProvisioningState {
+  PROVISION_SCANNING,   // scanning Wi-Fi networks on boot (8s)
+  PROVISION_AP,         // AP mode hotspot, portal serving config page
+  PROVISION_VERIFYING,  // testing submitted credentials against target Wi-Fi
+  PROVISION_CONNECTING, // after successful verify, switching to STA and connecting
+  PROVISION_FAILED,     // verification failed (portal still open)
+  PROVISION_SUCCESS     // fully connected to Wi-Fi (normal operation)
+};
 
 struct ProvisionNetwork {
   String ssid;
@@ -17,26 +26,27 @@ struct ProvisionNetwork {
 
 class ProvisioningPortal {
  public:
-  void begin(const char *fallbackSsid, const char *fallbackPassword, const char *fallbackBackend, const char *deviceId);
+  void begin(const char *fallbackBackend, const char *deviceId);
   void loop();
-  void startPortal();
   void requestScan();
 
   ProvisioningState state() const { return state_; }
-  bool isPortal() const { return state_ == PROVISION_AP || state_ == PROVISION_VERIFYING || state_ == PROVISION_FAILED || state_ == PROVISION_SUCCESS; }
-  bool isNormal() const { return state_ == PROVISION_NORMAL; }
+  bool isPortal() const { return state_ == PROVISION_AP || state_ == PROVISION_VERIFYING || state_ == PROVISION_FAILED; }
+  bool isConnected() const { return state_ == PROVISION_CONNECTING || state_ == PROVISION_SUCCESS; }
   bool needsRender() const { return renderRequested_; }
   void clearRenderRequest() { renderRequested_ = false; }
-  const String &ssid() const { return ssid_; }
   const String &backendUrl() const { return backendUrl_; }
   const String &apSsid() const { return apSsid_; }
   const String &message() const { return message_; }
   const String &candidateSsid() const { return pendingSsid_; }
+  const String &activeSsid() const { return ssid_; }
   bool backendHealthy() const { return backendHealthy_; }
+  void startPortal();
 
  private:
   static constexpr uint8_t MAX_NETWORKS = 16;
-  static constexpr uint32_t CONNECT_TIMEOUT_MS = 15000;
+  static constexpr uint32_t SCAN_TIMEOUT_MS = 8000;
+  static constexpr uint32_t VERIFY_TIMEOUT_MS = 15000;
   static constexpr uint32_t RESTART_DELAY_MS = 2200;
 
   Preferences preferences_;
@@ -57,9 +67,10 @@ class ProvisioningPortal {
 
   void setState(ProvisioningState next, const String &message);
   void finishScan(int16_t count);
-  void beginStationConnection();
-  void verifyProvisioningConnection();
-  void saveProvisioning();
+  void verifyCredentials();
+  void applySavedConfig();
+  void saveConfig(const String &ssid, const String &password, const String &backend);
+  void connectAndEnterNormal();
   void setupRoutes();
   void sendPortalPage();
   void sendJson(int code, JsonDocument &doc);
