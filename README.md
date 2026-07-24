@@ -17,6 +17,7 @@ uvicorn app:app --host 0.0.0.0 --port 8765
 Set `ROBOT_PANEL_API_TOKEN` only when a panel token is also configured in `firmware/robot_inspection_panel/config.h`.
 Set `DELIVERY_UNLOAD_TIMEOUT_SECONDS` to override the default 120-second unload timeout.
 Swagger documentation is available at `http://<backend-host>:8765/docs`.
+接口字段、任务状态流转、幂等规则和 curl 示例见 [backend/API.md](backend/API.md)。
 
 Run backend tests with:
 

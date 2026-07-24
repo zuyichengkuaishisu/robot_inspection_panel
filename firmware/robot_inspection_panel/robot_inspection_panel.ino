@@ -17,9 +17,9 @@ static constexpr uint8_t MAX_POINTS = 20;
 static constexpr uint8_t MAX_INSPECTIONS = 4;
 static constexpr unsigned long POLL_INTERVAL_MS = 1000;
 static constexpr unsigned long ROBOT_STATUS_STALE_MS = 3000;
-static constexpr int16_t POINT_VIEW_X = 32;
+static constexpr int16_t POINT_VIEW_X = 40;
 static constexpr int16_t POINT_VIEW_Y = 70;
-static constexpr int16_t POINT_VIEW_W = 176;
+static constexpr int16_t POINT_VIEW_W = 160;
 static constexpr int16_t POINT_VIEW_H = 170;
 
 class LGFX : public lgfx::LGFX_Device {
@@ -102,6 +102,7 @@ static int16_t point_scroll_anchor = 0;
 static bool point_scroll_dragging = false;
 static bool point_scroll_moved = false;
 static bool point_wait_for_release = false;
+static uint16_t point_scroll_start_x = 0;
 static uint16_t point_scroll_start_y = 0;
 static uint8_t point_scroll_gesture = 0;
 static unsigned long point_release_since = 0;
@@ -528,6 +529,18 @@ static void directButton(const String &text, int top, uint16_t border = TFT_CYAN
   directText(text, top + 17, 1, TFT_WHITE);
 }
 
+static void directSideButton(const String &text, int top, uint16_t border = TFT_CYAN) {
+  const int left = 8;
+  const int width = 32;
+  tft.fillRoundRect(left, top, width, 34, 5, TFT_DARKGREY);
+  tft.drawRoundRect(left, top, width, 34, 5, border);
+  tft.setFont(&fonts::efontCN_16);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(lgfx::middle_center);
+  tft.drawString(text, left + width / 2, top + 17);
+}
+
 static void renderUnloadCountdown() {
   int minutes = unload_remaining_seconds / 60;
   int seconds = unload_remaining_seconds % 60;
@@ -547,8 +560,8 @@ static void renderPointListViewport() {
     int point_index = pointIndexForSlot(slot);
     int top = 78 + slot * 38 - point_scroll - POINT_VIEW_Y;
     if (point_index < 0 || top >= POINT_VIEW_H || top + 34 <= 0) continue;
-    point_list_canvas.fillRoundRect(8, top, 160, 34, 5, 1);
-    point_list_canvas.drawRoundRect(8, top, 160, 34, 5, 2);
+    point_list_canvas.fillRoundRect(0, top, 160, 34, 5, 1);
+    point_list_canvas.drawRoundRect(0, top, 160, 34, 5, 2);
     String visible = points[point_index].name;
     bool truncated = point_list_canvas.textWidth(visible) > 148;
     while (visible.length() > 3 && point_list_canvas.textWidth(visible + "...") > 148) removeLastUtf8Character(visible);
@@ -629,6 +642,7 @@ static void renderDirectPage() {
     String title = point_list_mode == LIST_PICKUP ? "选择召唤点" : (point_list_mode == LIST_DELIVERY_DESTINATION ? "选择送货点" : "选择巡检点");
     directText(title, 30, 1, TFT_CYAN);
     directText("上下滑动查看更多", 56, 0, TFT_DARKGREY);
+    directSideButton("返回", 116);
     if (point_list_canvas_ready) renderPointListViewport();
     else for (uint8_t slot = 0; slot < listItemCount(); ++slot) {
       int point_index = pointIndexForSlot(slot);
@@ -757,6 +771,10 @@ static void handleRawTap(uint16_t x, uint16_t y) {
     if (y >= 140 && y < 174) { confirmOverride(); return; }
     if (y >= 180) { showPage(HOME); return; }
   } else if (page == POINT_LIST) {
+    if (x < 40 && y >= 116 && y < 150) {
+      goHome();
+      return;
+    }
     if (y >= 78 && y <= 230) {
       for (uint8_t slot = 0; slot < listItemCount(); ++slot) {
         int top = 78 + slot * 38 - point_scroll;
@@ -848,6 +866,7 @@ void loop() {
         point_scroll_dragging = true;
         point_scroll_moved = false;
         point_scroll_anchor = point_scroll;
+        point_scroll_start_x = raw_x;
         point_scroll_start_y = raw_y;
         point_scroll_gesture = raw_gesture;
       } else {
@@ -868,13 +887,14 @@ void loop() {
           point_scroll_moved = true;
         }
         bool was_tap = !point_scroll_moved;
+        uint16_t tap_x = point_scroll_start_x;
         uint16_t tap_y = point_scroll_start_y;
         point_scroll_dragging = false;
         point_release_since = 0;
         point_list_canvas_ready ? renderPointListViewport() : renderDirectPage();
         if (was_tap && millis() - last_raw_tap_ms >= 350) {
           last_raw_tap_ms = millis();
-          handleRawTap(0, tap_y);
+          handleRawTap(tap_x, tap_y);
         }
       }
     }
