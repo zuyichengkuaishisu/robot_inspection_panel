@@ -2,6 +2,7 @@
 
 ## Current State
 
+- 主分支基线: `091071c chore: trim vendor hardware resources`.
 - Target: ESP32-2424S012, ESP32-C3 (单核 160 MHz), 4 MB flash.
 - 屏幕: GC9A01 圆形 240×240, SPI (SCLK=6, MOSI=7, DC=2, CS=10), 80 MHz 写入.
 - 触控: CST816D at I2C 0x15 (INT=GPIO0, SDA=4, SCL=5).
@@ -9,18 +10,23 @@
 - 后端模拟器: `backend/app.py`.
 - 设备 MAC: `70:af:09:18:db:24`.
 - 后端运行于 `http://192.168.0.35:8765`.
-- 配网成功后面板 IP: `192.168.0.26`.
+- 最近一次 STA 地址: `192.168.0.26`（由 DHCP 分配，不应写死）.
 - 分区方案: `huge_app`（关闭 OTA，给应用 ~3 MB 空间）.
-- Flash 使用: ~50%, RAM: ~13%.
+- 编译结果: 1,599,928 bytes Flash (50%), 42,852 bytes global RAM (13%).
+- UI 仅使用 LovyanGFX 直接渲染，不再依赖或初始化 LVGL.
+- 仓库工作内容约 7.9 MB（不含 `.git` 和本地 `.venv`）.
+
+2026-07-24 最后验证时，后端健康检查正常；面板完成首页、点位滑动、选点和返回流程后，通过“配置网络”按钮进入 AP 配网模式。需要恢复 STA 时重新提交 Wi-Fi 和后端地址。
 
 ## 用户操作流程
 
-1. 启动 → Wi-Fi 连接（或 AP 配网）→ 获取点位列表.
-2. 点击某一点位 → 确认呼叫页面.
-3. 确认 → 发送导航请求 → 轮询 `navigating` → `arrived`.
-4. 到达后 → 选择"常规巡检" → 轮询 `running` → `completed`.
-5. 完成巡检 → 回到首页.
-6. **长按首页标题 `智巡精灵 v1.0` 5 秒** → 进入配网模式.
+1. 启动 → Wi-Fi 连接（或 AP 配网）→ 后台获取点位配置.
+2. 首页点击“选择点位” → 进入可上下滑动的点位列表.
+3. 点击某一点位 → 确认呼叫页面.
+4. 确认 → 发送导航请求 → 轮询 `navigating` → `arrived`.
+5. 到达后 → 选择“常规巡检” → 轮询 `running` → `completed`.
+6. 完成巡检 → 回到首页.
+7. 点击“配置网络”，或长按首页顶部 64 px 区域 5 秒 → 进入配网模式.
 
 ## 后端 API
 
@@ -36,6 +42,7 @@
 后端支持 `X-API-Token` Header 鉴权（通过环境变量 `ROBOT_PANEL_API_TOKEN` 设置）。
 模拟器通过 `RobotAdapter` 异步模拟机器人行为：导航 `queued→navigating→arrived`（~4s），巡检 `queued→running→completed`（~4s）。
 `event_id` 幂等：相同 event_id 重复请求返回已有任务。
+任务和幂等映射当前只保存在进程内存中，后端重启后会清空。
 
 ## 固件架构
 
@@ -49,6 +56,27 @@
 | `CST816D.cpp` / `.h` | 触控控制器驱动 |
 | `config.h` | 编译时后备 Wi-Fi/后端配置（git 忽略敏感值） |
 | `config.example.h` | 配置模板 |
+
+`config.h` 不再由 Git 跟踪。首次构建需从模板复制：
+
+```bash
+cp firmware/robot_inspection_panel/config.example.h \
+  firmware/robot_inspection_panel/config.h
+```
+
+当前本机仍保留可编译的 `config.h`。Wi-Fi 凭据曾出现在旧 Git 历史中，应视为已泄露并轮换；普通删除提交不会缩小或清除历史对象。
+
+### 仓库结构
+
+| 路径 | 内容 |
+| --- | --- |
+| `backend/` | FastAPI 模拟后端及 Python 依赖清单 |
+| `firmware/robot_inspection_panel/` | 当前可烧录固件 |
+| `1.28inch_ESP32-2424S012/` | 规格书、结构图、芯片资料、原理图、用户手册及最小显示示例 |
+| `README.md` | 快速启动说明 |
+| `HANDOFF.md` | 架构、运行状态与排障交接 |
+
+厂商目录中的第三方库副本、Factory/LVGL demo、Windows 工具、日志、烧录缓存和预编译固件已移除。旧对象仍存在于 Git 历史中，`.git` 目前约 122 MB；如需缩小克隆体积，必须另行执行历史重写并协调强制推送。
 
 ### 配网状态机（ProvisioningPortal）
 
@@ -106,6 +134,7 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 ### 圆屏 UI 渲染
 
 - **渲染引擎**：LovyanGFX 直接渲染。点位列表使用 176×170 的 2-bit 离屏画布一次性推送可视区，避免滑动时整屏闪烁。
+- **内存策略**：点位画布只使用黑、深灰、青、白 4 色，约占 7.5 KB heap；曾尝试的 8-bit 画布会挤占 Wi-Fi 初始化内存，禁止恢复为大色深缓冲。
 - **字体**：`efontCN_16`（中文字体），`setTextDatum(middle_center)` 居中绘制。
 - **安全区**：圆形屏幕中，`circularSafeWidth(y)` 计算给定 y 坐标的安全水平宽度（根据圆方程 `2*sqrt(120²-(y-120)²)`），避免文字超出圆形边缘。
 - **自适应字号**：`directText()` 在文字超宽时自动缩小字号或截断加省略号。
@@ -116,7 +145,8 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 
 | 页面 | 内容 |
 | --- | --- |
-| HOME | 标题"智巡精灵 v1.0"（青色）、Wi-Fi 状态、点位列表（按钮式）或"配置网络"按钮 |
+| HOME | 站点名、Wi-Fi 状态、“选择点位”和“配置网络”入口 |
+| POINT\_LIST | 可上下滑动的点位按钮列表 |
 | NETWORK\_SETUP | "网络配置"标题、QR 码/热点名/IP 或验证状态或失败提示 |
 | CONFIRM\_CALL | "确认呼叫"、点位名、取消/确认按钮 |
 | WAIT\_ARRIVAL | 任务状态（"发送中"→"前往点位"→"已到达"） |
@@ -127,8 +157,10 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 ### 触摸处理
 
 - 原始触摸通过 `touch.getTouch(&x, &y, &gesture)` 读取。
-- 350 ms 消抖（物理按下期间可能短暂报告释放）。
-- 触摸事件映射到按键区域：每页定义 `handleRawTap()` 的 `targetRects[]`。
+- 普通页面使用 350 ms 触摸门限，按 y 坐标命中当前页按钮。
+- 点位列表在松手时才区分点击与滑动：移动至少 8 px 视为拖动，否则视为选点。
+- CST816D 短暂掉触使用 40 ms 容错；控制器只返回手势时，上/下滑会按 114 px 步进滚动。
+- 打开点位页的那次按压必须先松手，不能被复用为列表点击。
 - 首页顶部 64px 区域检测长按 5 秒进入配网。
 - 后台每 250ms 输出诊断日志。
 
@@ -150,6 +182,8 @@ PROVISION_AP (纯 AP 模式 SmartInspect-XXXX)
 - 使用 `huge_app` 分区，因此当前不支持 OTA。
 - `RobotAdapter` 是睡眠等待模拟。接入真实机器人时需要保留面板侧 API 和 `event_id` 幂等性。
 - 新增页面内容时需继续通过 `circularSafeWidth()` 校验圆屏边界。
+- 点位和巡检项分别最多加载 20 和 4 条，超出部分会被截断。
+- Git 历史仍包含已删除的厂商大文件和旧 Wi-Fi 凭据；凭据需要轮换，历史瘦身需单独实施。
 
 ## 编译与烧录
 
@@ -166,6 +200,8 @@ arduino-cli upload --verify \
 ```
 
 用户需属于 `dialout` 组以访问 `/dev/ttyACM0`。
+
+固件依赖：LovyanGFX、ArduinoJson、QRCode（`esp_qrcode`）。不需要 LVGL。
 
 ## 运行后端
 
@@ -185,3 +221,9 @@ Swagger 文档：`http://192.168.0.35:8765/docs`。后端地址变化时同步�
 2. **无线 OTA** — 需要调整当前 `huge_app` 分区方案
 3. **真实机器人 HTTP 适配器** — 替换 `RobotAdapter` 模拟器
 4. **多语言支持** — 后端巡检点位提供语言字段
+
+## 最近完成
+
+- `7a92a0e`: 点位列表点击/拖动分离，支持滑动选择更多点位。
+- `33ab10c`: 移除未使用的 LVGL、旧页面构建器、双缓冲和 DMA 初始化。
+- `091071c`: 精简厂商资源、停止跟踪敏感配置和 Python 缓存，统一文档端口为 `8765`。
